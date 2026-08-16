@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dave · 英文会议陪练</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app">
+    <!-- 顶栏 -->
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-avatar" id="brand-avatar">D</div>
+        <div class="brand-text">
+          <h1>英文口语陪练</h1>
+          <p>会打断、会追问、会纠错的 AI 陪练 · 多角色</p>
+        </div>
+      </div>
+
+      <div class="topbar-actions">
+        <select id="persona-select" class="scenario-select" title="选择陪练角色"></select>
+        <select id="scenario-select" class="scenario-select" title="选择场景"></select>
+        <button id="btn-review" class="btn btn-ghost" title="结束本次会议并生成复盘">结束复盘</button>
+        <button id="btn-new" class="btn btn-ghost" title="新建会话">新会话</button>
+        <button id="btn-settings" class="btn btn-ghost" title="模型设置">⚙ 设置</button>
+      </div>
+    </header>
+
+    <!-- 主体 -->
+    <div class="main">
+      <!-- 聊天区 -->
+      <section class="chat-panel">
+        <div id="chat" class="chat">
+          <div id="welcome" class="welcome">
+            <p class="welcome-title">Pick a lane. Say a number.</p>
+            <ul class="welcome-list" id="welcome-list"></ul>
+          </div>
+        </div>
+
+        <div class="input-bar">
+          <button id="btn-mic" class="icon-btn" title="语音输入（说英文）">🎤</button>
+          <textarea id="input" rows="1" placeholder="用英文说 / 输入你的回应，Enter 发送，Shift+Enter 换行"></textarea>
+          <button id="btn-send" class="btn btn-primary">发送</button>
+        </div>
+        <div id="mic-status" class="mic-status">点击 🎤 开始说话（需要 localhost 或 HTTPS）</div>
+      </section>
+
+      <!-- 侧栏 -->
+      <aside class="sidebar">
+        <div class="tabs">
+          <button class="tab active" data-tab="phrasebook">表达收藏</button>
+          <button class="tab" data-tab="history">历史</button>
+          <button id="btn-close-drawer" class="icon-btn drawer-close" type="button" title="关闭">✕</button>
+        </div>
+
+        <div id="tab-phrasebook" class="tab-panel">
+          <div class="tab-head-row">
+            <p class="tab-hint">点纠错卡片上的 ☆ 收藏地道表达，会后复习。</p>
+            <button id="btn-speak-all" class="btn btn-ghost btn-speak-all" type="button">朗读全部</button>
+          </div>
+          <div id="phrasebook-list" class="card-list"></div>
+        </div>
+
+        <div id="tab-history" class="tab-panel hidden">
+          <p class="tab-hint">你的练习记录保存在本机浏览器里。</p>
+          <div id="history-list" class="card-list"></div>
+        </div>
+      </aside>
+    </div>
+
+    <div id="drawer-backdrop" class="drawer-backdrop hidden"></div>
+    <nav class="mobile-dock" id="mobile-dock" aria-label="移动端收藏与历史">
+      <button type="button" class="dock-btn" data-open-tab="phrasebook">⭐ 收藏</button>
+      <button type="button" class="dock-btn" data-open-tab="history">🕘 历史</button>
+    </nav>
+  </div>
+
+  <!-- 设置弹窗 -->
+  <div id="settings-overlay" class="overlay hidden">
+    <div class="modal">
+      <div class="modal-head">
+        <h2>模型设置</h2>
+        <button id="btn-close-settings" class="icon-btn">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="presets">
+          <button class="preset" data-base="https://api.deepseek.com/v1" data-model="deepseek-chat">DeepSeek</button>
+          <button class="preset" data-base="https://api.openai.com/v1" data-model="gpt-4o-mini">OpenAI</button>
+          <button class="preset" data-base="https://api.moonshot.cn/v1" data-model="moonshot-v1-8k">Moonshot</button>
+          <button class="preset" data-base="https://api.x.ai/v1" data-model="grok-4.6">xAI Grok</button>
+          <button class="preset" data-base="https://open.bigmodel.cn/api/paas/v4" data-model="glm-4-flash">智谱 GLM</button>
+          <button class="preset" data-base="https://dashscope.aliyuncs.com/compatible-mode/v1" data-model="qwen-plus">通义 Qwen</button>
+        </div>
+
+        <label class="field">
+          <span>Base URL</span>
+          <input id="cfg-base" type="text" placeholder="https://api.deepseek.com/v1" />
+        </label>
+        <label class="field">
+          <span>API Key</span>
+          <input id="cfg-key" type="password" placeholder="sk-..." autocomplete="off" />
+        </label>
+        <label class="field">
+          <span>模型名</span>
+          <input id="cfg-model" type="text" placeholder="deepseek-chat" />
+        </label>
+        <label class="field field-row">
+          <span>温度（0 更稳 / 1 更活）</span>
+          <input id="cfg-temp" type="number" min="0" max="2" step="0.1" value="0.7" />
+        </label>
+        <label class="field field-check">
+          <input id="cfg-json" type="checkbox" checked />
+          <span>强制 JSON 输出（OpenAI/DeepSeek 支持，出错可关闭）</span>
+        </label>
+        <label class="field field-check">
+          <input id="cfg-stream" type="checkbox" checked />
+          <span>流式输出（打字机效果；模型不支持时自动回退）</span>
+        </label>
+        <label class="field field-check">
+          <input id="cfg-handsfree" type="checkbox" />
+          <span>免提模式（对方朗读完自动听你说，默认关）</span>
+        </label>
+
+        <p class="modal-note">Key 只存在你本机浏览器 localStorage，不会上传到别处。</p>
+
+        <div class="modal-foot">
+          <button id="btn-test" class="btn btn-ghost">测试连接</button>
+          <button id="btn-save" class="btn btn-primary">保存</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
