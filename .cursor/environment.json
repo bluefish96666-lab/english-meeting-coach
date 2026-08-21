@@ -1,0 +1,11 @@
+{
+  "name": "english-meeting-coach",
+  "install": "python3 -c \"import http.server, pathlib, sys; files=('index.html','app.js','styles.css'); missing=[f for f in files if not pathlib.Path(f).is_file()]; sys.exit('missing: ' + ', '.join(missing)) if missing else print('ok: static files + http.server available')\"",
+  "start": "if curl -sf --max-time 1 http://127.0.0.1:8000/ >/dev/null; then echo 'static server already running on :8000'; else python3 -m http.server 8000 --bind 0.0.0.0 >/tmp/english-meeting-coach-http.log 2>&1 & for i in $(seq 1 40); do curl -sf --max-time 1 http://127.0.0.1:8000/ >/dev/null && echo 'static server ready on :8000' && exit 0; sleep 0.25; done; echo 'static server failed to start' >&2; cat /tmp/english-meeting-coach-http.log >&2 || true; exit 1; fi",
+  "ports": [
+    {
+      "name": "web",
+      "port": 8000
+    }
+  ]
+}
