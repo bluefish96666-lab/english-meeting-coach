@@ -19,6 +19,23 @@
 - 🔌 **通用模型**：兼容 OpenAI 接口格式，Key 只存本机。
 - 📱 **手机端**：窄屏侧栏收起，底部「学习 / 收藏 / 历史」抽屉。
 
+## 在线 Demo（GitHub Pages）
+
+仓库已推送 `gh-pages` 分支。若尚未开启 Pages，请到仓库 **Settings → Pages → Build and deployment**，Source 选 **Deploy from a branch**，Branch 选 `gh-pages` / `/ (root)`，保存后访问：
+
+**https://bluefish96666-lab.github.io/english-meeting-coach/**
+
+（也可在合并到 `main` 后，用 Actions 工作流 `.github/workflows/pages.yml` 自动发布。）
+
+本地预览仍推荐：
+
+```bash
+# 方式一：Python（推荐，最简单）
+cd english-meeting-coach
+python -m http.server 8000
+# 浏览器打开 http://localhost:8000
+```
+
 ## 运行
 
 这是纯静态页面，但**语音识别要求 `localhost` 或 `HTTPS`**，所以不要双击 `file://` 直接开。任选一种：
