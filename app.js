@@ -374,6 +374,9 @@ const HISTORY_CORR_CAP = 800;
 
 /* ------------------------------ 状态 -------------------------------- */
 let config = { ...DEFAULT_CONFIG, ...store.get('dave_config', {}) };
+if (!config.industry || (typeof INDUSTRY_PACKS !== 'undefined' && !INDUSTRY_PACKS[config.industry])) {
+  config.industry = 'none';
+}
 let currentPersona = PERSONAS[0];
 let session = null; // { id, persona, scenario, messages: [{role,text,correction?,focus?}] }
 let phrases = sanitizePhraseList(store.get('dave_phrasebook', []));
