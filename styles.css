@@ -177,9 +177,97 @@ html, body {
   margin-top: 8px; padding-top: 8px; border-top: 1px dashed #2a4a41;
   color: var(--warn); font-size: 12.5px;
 }
+.corr-actions {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  margin-top: 10px; padding-top: 8px; border-top: 1px dashed #2a4a41;
+}
+.corr-actions .mini-btn {
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 4px 8px; font-size: 11.5px; cursor: pointer;
+}
+.corr-actions .mini-btn:hover { border-color: var(--accent); color: #fff; }
+
+/* ===== 学习中心 ===== */
+.learn-block { margin-bottom: 14px; }
+.learn-label { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+.seg { display: flex; gap: 6px; }
+.seg-btn {
+  flex: 1; background: var(--panel-2); color: var(--muted);
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 6px; font-size: 13px; cursor: pointer; font-weight: 600;
+}
+.seg-btn.active { background: var(--accent-soft); color: var(--text); border-color: var(--accent); }
+.learn-actions {
+  display: flex; flex-direction: column; gap: 8px;
+  margin: 4px 0 14px;
+}
+.learn-actions .btn { width: 100%; }
+.habit-status {
+  font-size: 12.5px; color: var(--muted);
+  background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: 8px; padding: 10px 12px; margin-bottom: 12px;
+  line-height: 1.5;
+}
+.habit-status strong { color: var(--good); }
+.plan-view, .core-view { margin-top: 8px; }
+.plan-card, .core-card, .habit-card {
+  background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: 10px; padding: 12px; font-size: 13px; margin-bottom: 10px;
+  line-height: 1.55;
+}
+.plan-card h4, .core-card h4, .habit-card h4 {
+  margin: 0 0 8px; font-size: 13.5px; color: var(--text);
+}
+.plan-week {
+  margin: 8px 0; padding: 8px 10px;
+  background: rgba(79,124,255,.08); border-radius: 8px;
+  border-left: 3px solid var(--accent);
+}
+.plan-week .w-title { font-weight: 700; margin-bottom: 4px; }
+.core-item {
+  display: flex; gap: 8px; align-items: flex-start;
+  padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 12.5px;
+}
+.core-item:last-child { border-bottom: none; }
+.core-item .pri {
+  flex-shrink: 0; min-width: 22px; height: 22px;
+  border-radius: 6px; background: var(--accent-soft); color: var(--accent);
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 700;
+}
+.core-item .en { color: #c6f5e3; font-weight: 600; }
+.core-item .zh { color: var(--muted); font-size: 11.5px; margin-top: 2px; }
+.core-item .scene { color: var(--warn); font-size: 11px; margin-top: 2px; }
+.core-item .core-acts { margin-left: auto; display: flex; gap: 4px; flex-shrink: 0; }
+.core-item .core-acts button {
+  background: none; border: none; cursor: pointer; color: var(--accent); font-size: 13px; padding: 2px;
+}
+.core-scene-title {
+  font-size: 12px; font-weight: 700; color: var(--muted);
+  margin: 12px 0 4px; text-transform: none;
+}
+.phrase-card .mnemonic {
+  margin-top: 6px; font-size: 12px; color: var(--muted);
+  background: rgba(240,168,60,.08); border-radius: 6px; padding: 6px 8px;
+}
+.phrase-card .p-acts { display: flex; gap: 4px; align-items: center; }
+.phrase-card .p-acts button {
+  background: none; border: none; cursor: pointer; color: var(--accent); font-size: 12px;
+}
+.phrase-card .p-acts .del { color: var(--muted); }
+.coach-body {
+  white-space: pre-wrap; word-break: break-word;
+  font-size: 14px; line-height: 1.6; color: var(--text);
+  min-height: 80px;
+}
+.modal-coach { max-width: 520px; }
+.habit-steps { margin: 8px 0 0; padding-left: 18px; color: var(--muted); font-size: 12.5px; }
+.habit-steps li { margin: 4px 0; }
 
 .star-btn {
-  background: none; border: none; cursor: pointer; font-size: 16px; color: var(--muted);
+  background: none; border: none; cursor: pointer;
+  font-size: 16px; color: var(--muted);
 }
 .star-btn:hover { color: var(--warn); }
 .star-btn.starred { color: var(--warn); }
@@ -269,6 +357,58 @@ html, body {
 .history-card .h-sub { color: var(--muted); font-size: 11.5px; }
 .history-card { cursor: pointer; }
 .history-card:hover { border-color: var(--accent); }
+
+.review-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; margin-bottom: 12px;
+  padding: 10px 12px;
+  background: rgba(79,124,255,.08);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.review-stats { font-size: 12.5px; color: var(--muted); line-height: 1.4; }
+.review-stats strong { color: var(--warn); }
+.review-stage {
+  background: var(--panel-2);
+  border: 1px solid var(--accent-soft);
+  border-radius: 12px;
+  padding: 14px;
+  margin-bottom: 12px;
+}
+.review-stage .rv-label { font-size: 11.5px; color: var(--muted); margin-bottom: 8px; }
+.review-stage .rv-en {
+  font-size: 18px; font-weight: 650; color: #c6f5e3;
+  line-height: 1.45; margin-bottom: 8px;
+}
+.review-stage .rv-meta { font-size: 12px; color: var(--muted); margin-bottom: 12px; }
+.review-stage .rv-hint {
+  font-size: 12.5px; color: var(--text);
+  background: rgba(240,168,60,.08);
+  border-radius: 8px; padding: 8px 10px; margin-bottom: 12px;
+  white-space: pre-wrap;
+}
+.review-grades { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.review-grades .g-btn {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 10px 8px;
+  cursor: pointer;
+  font-size: 13px; font-weight: 650;
+}
+.review-grades .g-btn small {
+  display: block; font-weight: 500; color: var(--muted);
+  font-size: 11px; margin-top: 3px;
+}
+.review-grades .g-again { border-color: #6b2a32; color: #f2c9cd; }
+.review-grades .g-hard { border-color: #6b4e22; color: #f0d2a0; }
+.review-grades .g-good { border-color: #1f3d34; color: #c6f5e3; }
+.review-grades .g-easy { border-color: var(--accent-soft); color: #b8ccff; }
+.review-grades .g-btn:hover { filter: brightness(1.12); }
+.phrase-card .due { font-size: 11px; color: var(--muted); margin-top: 4px; }
+.phrase-card .due.due-now { color: var(--warn); }
+.phrase-card .due.due-new { color: var(--accent); }
 
 .empty { color: var(--muted); font-size: 13px; text-align: center; padding: 24px 0; }
 

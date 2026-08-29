@@ -272,19 +272,23 @@ const PERSONAS = [
 
 /* ------------------------- 通用输出格式（拼接） ----------------------- */
 function buildSystemPrompt(persona, scenarioName, scenarioDesc) {
+  const level = (learner && learner.level) || 'intermediate';
+  const levelHint = level === 'beginner'
+    ? 'The user is A2–B1 (beginner). Use shorter sentences, high-frequency words, and slightly slower spoken style. Still stay in character.'
+    : 'The user is B1–B2 (intermediate). Use clear American English at a normal speaking pace. Challenge them a bit.';
   return [
     persona.promptBody,
     '',
     'Current scenario: ' + scenarioName + ' (' + scenarioDesc + ').',
     '',
     'Rules:',
-    '1. ALWAYS stay in character and speak English in the "reply" field. Use clear American English at a normal speaking pace. The user is B1 level.',
+    '1. ALWAYS stay in character and speak English in the "reply" field. ' + levelHint,
     '2. You only play the other party in this conversation. Do NOT teach and do NOT give answers during the roleplay.',
     '',
     'Output format — respond with ONLY a JSON object, no markdown fences, no extra text:',
-    '{"reply":"your short in-character English reply (1-3 sentences, spoken style)","correction":"① 你说的是：<the user\'s exact last English sentence>\\n② 更地道的是：<corrected natural spoken English>\\n③ 为什么：<one short line explaining the fix and a more natural phrasing>","focus":"one short Chinese line on the single most important improvement this round among: ' + persona.focusDims + '"}',
+    '{"reply":"your short in-character English reply (1-3 sentences, spoken style)","correction":"① 你说的是：<the user\'s exact last English sentence>\\n② 更地道的是：<how a native speaker would actually say it>\\n③ 为什么：<one short Chinese line: what was wrong + why the native version is better>","focus":"one short Chinese line on the single most important improvement this round among: ' + persona.focusDims + '"}',
     '',
-    'For "correction": quote the user\'s actual last English message as <原文>. If it was already fine, still pick the weakest part. Keep ② in natural spoken English and ③ to one line.',
+    'For "correction": quote the user\'s actual last English message. If it was already fine, still polish the weakest part toward native spoken English. Keep ② natural and spoken; keep ③ to one line in Chinese.',
     'Keep "reply" strictly in character — do not put teaching or correction inside "reply".',
   ].join('\n');
 }
@@ -331,6 +335,22 @@ const DEFAULT_CONFIG = {
   handsfree: false,
 };
 
+const DEFAULT_LEARNER = {
+  level: 'intermediate', // beginner | intermediate
+  goal: 'work', // work | conversation | travel
+  plan: null,
+  coreByGoal: {}, // goal -> { items: [...], ts }
+  habit: { streak: 0, lastDate: '', todayDone: false },
+};
+
+const GOAL_META = {
+  work: { label: '工作', personaIds: ['dave', 'client', 'interviewer'], coreHint: '英文工作会议 / 商务沟通 / 面试' },
+  conversation: { label: '会话', personaIds: ['dave', 'ielts'], coreHint: '日常英文会话与流利表达' },
+  travel: { label: '旅行', personaIds: ['travel'], coreHint: '机场、海关、餐厅、酒店等旅行场景' },
+};
+
+const LEVEL_LABEL = { beginner: '初级', intermediate: '中级' };
+
 const MAX_TOKENS = 800;
 const HISTORY_MSG_CAP = 40;
 const HISTORY_TEXT_CAP = 1800;
@@ -338,12 +358,39 @@ const HISTORY_CORR_CAP = 800;
 
 /* ------------------------------ 状态 -------------------------------- */
 let config = { ...DEFAULT_CONFIG, ...store.get('dave_config', {}) };
+let learner = sanitizeLearner(store.get('dave_learner', DEFAULT_LEARNER));
 let currentPersona = PERSONAS[0];
 let session = null; // { id, persona, scenario, messages: [{role,text,correction?,focus?}] }
 let phrases = sanitizePhraseList(store.get('dave_phrasebook', []));
 let history = sanitizeHistoryList(store.get('dave_history', []));
 let turnBusy = false;
 let requestGen = 0;
+let coachSpeakText = '';
+
+function todayKey() {
+  const d = new Date();
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+
+function sanitizeLearner(raw) {
+  const base = { ...DEFAULT_LEARNER, ...(raw && typeof raw === 'object' ? raw : {}) };
+  if (base.level !== 'beginner' && base.level !== 'intermediate') base.level = 'intermediate';
+  if (!GOAL_META[base.goal]) base.goal = 'work';
+  if (!base.coreByGoal || typeof base.coreByGoal !== 'object') base.coreByGoal = {};
+  const habit = base.habit && typeof base.habit === 'object' ? base.habit : {};
+  base.habit = {
+    streak: Number(habit.streak) || 0,
+    lastDate: typeof habit.lastDate === 'string' ? habit.lastDate : '',
+    todayDone: !!habit.todayDone,
+  };
+  const today = todayKey();
+  if (base.habit.lastDate !== today) base.habit.todayDone = false;
+  return base;
+}
+
+function persistLearner() {
+  persistOrWarn('dave_learner', learner);
+}
 
 function sanitizeHistoryItem(h) {
   if (!h || typeof h !== 'object') return null;
@@ -385,8 +432,91 @@ function sanitizePhraseItem(p) {
   return {
     en,
     scenarioName: String(p.scenarioName == null ? '' : p.scenarioName),
+    mnemonic: p.mnemonic ? String(p.mnemonic) : '',
+    note: p.note ? String(p.note) : '',
     ts: Number.isFinite(ts) ? ts : Date.now(),
+    card: sanitizeFsrsCard(p.card, ts),
   };
+}
+
+function sanitizeFsrsCard(raw, fallbackTs) {
+  const now = new Date(Number.isFinite(fallbackTs) ? fallbackTs : Date.now());
+  const base = ensureFsrsApi()
+    ? window.tsfsrs.createEmptyCard(now)
+    : {
+        due: now,
+        stability: 0,
+        difficulty: 0,
+        elapsed_days: 0,
+        scheduled_days: 0,
+        reps: 0,
+        lapses: 0,
+        state: 0,
+        last_review: undefined,
+      };
+  if (!raw || typeof raw !== 'object') return serializeFsrsCard(base);
+  return serializeFsrsCard({
+    due: raw.due ? new Date(raw.due) : base.due,
+    stability: Number(raw.stability) || 0,
+    difficulty: Number(raw.difficulty) || 0,
+    elapsed_days: Number(raw.elapsed_days) || 0,
+    scheduled_days: Number(raw.scheduled_days) || 0,
+    reps: Number(raw.reps) || 0,
+    lapses: Number(raw.lapses) || 0,
+    state: Number(raw.state) || 0,
+    last_review: raw.last_review ? new Date(raw.last_review) : undefined,
+  });
+}
+
+function serializeFsrsCard(card) {
+  return {
+    due: card.due instanceof Date ? card.due.toISOString() : String(card.due),
+    stability: Number(card.stability) || 0,
+    difficulty: Number(card.difficulty) || 0,
+    elapsed_days: Number(card.elapsed_days) || 0,
+    scheduled_days: Number(card.scheduled_days) || 0,
+    reps: Number(card.reps) || 0,
+    lapses: Number(card.lapses) || 0,
+    state: Number(card.state) || 0,
+    last_review: card.last_review
+      ? (card.last_review instanceof Date ? card.last_review.toISOString() : String(card.last_review))
+      : undefined,
+  };
+}
+
+function hydrateFsrsCard(stored) {
+  const c = sanitizeFsrsCard(stored);
+  return {
+    due: new Date(c.due),
+    stability: c.stability,
+    difficulty: c.difficulty,
+    elapsed_days: c.elapsed_days,
+    scheduled_days: c.scheduled_days,
+    reps: c.reps,
+    lapses: c.lapses,
+    state: c.state,
+    last_review: c.last_review ? new Date(c.last_review) : undefined,
+  };
+}
+
+function ensureFsrsApi() {
+  return !!(window.tsfsrs && window.tsfsrs.scheduler && window.tsfsrs.Rating);
+}
+
+function waitForFsrs(timeoutMs) {
+  if (ensureFsrsApi()) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const t = setTimeout(() => {
+      window.removeEventListener('tsfsrs-ready', onReady);
+      resolve(ensureFsrsApi());
+    }, timeoutMs || 4000);
+    function onReady() {
+      clearTimeout(t);
+      window.removeEventListener('tsfsrs-ready', onReady);
+      resolve(ensureFsrsApi());
+    }
+    window.addEventListener('tsfsrs-ready', onReady);
+  });
 }
 
 function sanitizePhraseList(list) {
@@ -533,7 +663,7 @@ function buildCorrectionCard(correction, focus) {
 
   const head = document.createElement('div');
   head.className = 'corr-head';
-  head.innerHTML = '<span>📝 纠错</span>';
+  head.innerHTML = '<span>📝 纠错 · 母语者说法</span>';
   const star = document.createElement('button');
   star.className = 'star-btn';
   star.textContent = '☆';
@@ -550,7 +680,14 @@ function buildCorrectionCard(correction, focus) {
     } else {
       star.textContent = '★';
       star.classList.add('starred');
-      phrases.unshift({ en: better, scenarioName: scn ? scn.name : currentPersona.name, ts: Date.now() });
+      phrases.unshift({
+        en: better,
+        scenarioName: scn ? scn.name : currentPersona.name,
+        ts: Date.now(),
+        card: serializeFsrsCard(
+          ensureFsrsApi() ? window.tsfsrs.createEmptyCard(new Date()) : { due: new Date(), stability: 0, difficulty: 0, elapsed_days: 0, scheduled_days: 0, reps: 0, lapses: 0, state: 0 }
+        ),
+      });
     }
     persistOrWarn('dave_phrasebook', phrases);
     renderPhrasebook();
@@ -575,6 +712,27 @@ function buildCorrectionCard(correction, focus) {
     f.textContent = '🎯 ' + focus;
     card.appendChild(f);
   }
+
+  const better = extractBetter(correction);
+  const orig = extractOrig(correction);
+  const actions = document.createElement('div');
+  actions.className = 'corr-actions';
+  const mk = (label, title, fn) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'mini-btn';
+    b.textContent = label;
+    b.title = title;
+    b.addEventListener('click', fn);
+    return b;
+  };
+  actions.appendChild(mk('语法讲人话', '用简单中文讲清语法点', () => coachGrammar(orig, better, correction)));
+  actions.appendChild(mk('练发音', '拆音素 + 易错点', () => coachPronunciation(better || orig)));
+  actions.appendChild(mk('记忆法', '故事/画面帮你记住', () => coachMnemonic(better || orig)));
+  if (better) {
+    actions.appendChild(mk('🔊 地道版', '朗读母语者说法', () => speak(better)));
+  }
+  card.appendChild(actions);
   return card;
 }
 
@@ -582,7 +740,14 @@ function extractBetter(correction) {
   const m = String(correction).match(/②[^：:]*[：:]\s*(.+)/);
   if (m) return m[1].trim();
   const line = String(correction).split('\n').find((l) => l.includes('②'));
-  return line ? line.trim() : '';
+  return line ? line.replace(/^.*?[：:]/, '').trim() : '';
+}
+
+function extractOrig(correction) {
+  const m = String(correction).match(/①[^：:]*[：:]\s*(.+)/);
+  if (m) return m[1].trim();
+  const line = String(correction).split('\n').find((l) => l.includes('①'));
+  return line ? line.replace(/^.*?[：:]/, '').trim() : '';
 }
 
 /* ---------------------------- LLM 调用 ------------------------------ */
@@ -599,12 +764,13 @@ function friendlyApiError(status, errText) {
   return extra ? `API ${status}: ${extra}` : `API ${status}`;
 }
 
-function applyTokenLimit(body, model) {
+function applyTokenLimit(body, model, maxTokens) {
   const name = String(model || '');
+  const n = Number(maxTokens) > 0 ? Number(maxTokens) : MAX_TOKENS;
   if (/grok|gpt-5|^o[1-9]|o-mini|o3/i.test(name)) {
-    body.max_completion_tokens = MAX_TOKENS;
+    body.max_completion_tokens = n;
   } else {
-    body.max_tokens = MAX_TOKENS;
+    body.max_tokens = n;
   }
 }
 
@@ -614,7 +780,7 @@ function buildChatBody(messages, systemPrompt, cfg, opts, stream) {
     temperature: Number(cfg.temp ?? 0.7),
     messages: [{ role: 'system', content: systemPrompt }, ...messages],
   };
-  applyTokenLimit(body, cfg.model);
+  applyTokenLimit(body, cfg.model, opts && opts.maxTokens);
   if (cfg.json && opts.json !== false) {
     body.response_format = { type: 'json_object' };
   }
@@ -1028,6 +1194,433 @@ async function endReview() {
     if (typing.parentNode) typing.remove();
     if (gen === requestGen) turnBusy = false;
   }
+}
+
+/* ---------------------- 教练加深：语法 / 发音 / 记忆法 ---------------------- */
+function ensureApiKey() {
+  if (config.key) return true;
+  addMessage('system', '请先到「⚙ 设置」填入 API Key，再使用学习 / 教练功能。', null, null);
+  openSettings();
+  return false;
+}
+
+function openCoachModal(title, bodyText, speakEn) {
+  coachSpeakText = speakEn || '';
+  $('coach-title').textContent = title;
+  $('coach-body').textContent = bodyText;
+  const speakBtn = $('btn-coach-speak');
+  if (speakBtn) speakBtn.style.display = coachSpeakText ? '' : 'none';
+  $('coach-overlay').classList.remove('hidden');
+}
+
+function closeCoachModal() {
+  $('coach-overlay').classList.add('hidden');
+}
+
+async function runCoachPrompt(title, systemPrompt, userContent, speakEn) {
+  if (!ensureApiKey()) return '';
+  if (turnBusy) {
+    addMessage('system', '对方还在回复，请稍后再用教练功能。', null, null);
+    return '';
+  }
+  turnBusy = true;
+  openCoachModal(title, '正在生成…', speakEn);
+  try {
+    const raw = await chatCompletion(
+      [{ role: 'user', content: userContent }],
+      systemPrompt,
+      { json: true, maxTokens: 1000 }
+    );
+    const parsed = parseJson(raw);
+    const text = (parsed && (parsed.explain || parsed.text || parsed.tip)) || (raw || '').trim();
+    openCoachModal(title, text, speakEn);
+    return text;
+  } catch (err) {
+    openCoachModal(title, '生成失败：' + err.message, speakEn);
+    return '';
+  } finally {
+    turnBusy = false;
+  }
+}
+
+function coachGrammar(orig, better, correction) {
+  const sys = [
+    '你是英语语法教练。用简单中文讲人话，不要术语堆砌。',
+    '只输出 JSON：{"explain":"..."}',
+    'explain 结构：',
+    '1) 一句话点明语法点',
+    '2) 给 3 个清楚英文例句（每句后括号中文意思）',
+    '3) 补 1 个中国学习者最常见的坑',
+    '直接给内容，不要寒暄。',
+  ].join('\n');
+  const user = '原文：' + (orig || '（无）') + '\n更地道：' + (better || '（无）') + '\n纠错卡：\n' + (correction || '');
+  return runCoachPrompt('语法讲人话', sys, user, better || orig);
+}
+
+function coachPronunciation(phrase) {
+  if (!phrase) {
+    addMessage('system', '没有可练发音的英文。', null, null);
+    return Promise.resolve('');
+  }
+  const sys = [
+    '你是英语发音教练，面向中文母语者。',
+    '只输出 JSON：{"explain":"..."}',
+    'explain 结构：',
+    '1) 目标词/短语 + 简易音标（可用近似拼读）',
+    '2) 按音节/音素拆开，告诉嘴型与气流',
+    '3) 指出英语学习者（尤其中文母语）最容易发错的地方',
+    '4) 给一句跟读小技巧',
+    '直接给内容，不要寒暄。',
+  ].join('\n');
+  return runCoachPrompt('专治发音', sys, '帮我改进发音：' + phrase, phrase);
+}
+
+function coachMnemonic(phrase) {
+  if (!phrase) {
+    addMessage('system', '没有可做记忆法的英文。', null, null);
+    return Promise.resolve('');
+  }
+  const sys = [
+    '你是记忆法教练。给英文词/短语做好记、难忘的记忆钩子。',
+    '只输出 JSON：{"explain":"..."}',
+    'explain 用中文，含：一个小故事或画面 + 一句谐音/联想（可选）+ 一句使用场景提醒。',
+    '要好记，不要学术。',
+  ].join('\n');
+  return runCoachPrompt('一次记住', sys, '给这个表达做记忆法：' + phrase, phrase);
+}
+
+/* ------------------------------ 学习中心 -------------------------------- */
+function setLearnerLevel(level) {
+  if (level !== 'beginner' && level !== 'intermediate') return;
+  learner.level = level;
+  persistLearner();
+  renderLearnCenter();
+}
+
+function setLearnerGoal(goal) {
+  if (!GOAL_META[goal]) return;
+  learner.goal = goal;
+  persistLearner();
+  renderLearnCenter();
+}
+
+function renderLearnCenter() {
+  document.querySelectorAll('#level-seg .seg-btn').forEach((b) => {
+    b.classList.toggle('active', b.dataset.level === learner.level);
+  });
+  document.querySelectorAll('#goal-seg .seg-btn').forEach((b) => {
+    b.classList.toggle('active', b.dataset.goal === learner.goal);
+  });
+
+  const habitEl = $('habit-status');
+  if (habitEl) {
+    const streak = learner.habit.streak || 0;
+    const done = learner.habit.todayDone;
+    habitEl.innerHTML = done
+      ? '今日 20 分钟：<strong>已完成</strong> · 连续 <strong>' + streak + '</strong> 天'
+      : '今日 20 分钟：未完成 · 连续 <strong>' + streak + '</strong> 天 · 点上方按钮开练';
+  }
+
+  renderPlanView();
+  renderCoreView();
+}
+
+function renderPlanView() {
+  const el = $('plan-view');
+  if (!el) return;
+  const plan = learner.plan;
+  if (!plan) {
+    el.innerHTML = '<div class="empty">还没有 4 周计划。选好水平/目标后点「生成 4 周计划」。</div>';
+    return;
+  }
+  const weeks = Array.isArray(plan.weeks) ? plan.weeks : [];
+  let html = '<div class="plan-card"><h4>📋 4 周计划 · ' + escapeHtml(LEVEL_LABEL[learner.level] || '') + ' · ' + escapeHtml((GOAL_META[learner.goal] || {}).label || '') + '</h4>';
+  if (plan.summary) html += '<div>' + escapeHtml(plan.summary) + '</div>';
+  weeks.forEach((w, i) => {
+    html += '<div class="plan-week"><div class="w-title">第 ' + (w.week || i + 1) + ' 周 · ' + escapeHtml(w.focus || '') + '</div>';
+    html += '<div>' + escapeHtml(w.tasks || w.detail || '') + '</div>';
+    if (w.scenarioHint) html += '<div style="margin-top:4px;color:var(--muted)">推荐场景：' + escapeHtml(w.scenarioHint) + '</div>';
+    html += '</div>';
+  });
+  if (plan.dailyHabit) {
+    html += '<div style="margin-top:8px;color:var(--muted)">每日习惯：' + escapeHtml(plan.dailyHabit) + '</div>';
+  }
+  html += '</div>';
+  el.innerHTML = html;
+}
+
+function renderCoreView() {
+  const el = $('core-view');
+  if (!el) return;
+  const pack = learner.coreByGoal[learner.goal];
+  if (!pack || !Array.isArray(pack.items) || !pack.items.length) {
+    el.innerHTML = '<div class="empty">还没有核心词表。点「核心 100 词」按你的目标生成。</div>';
+    return;
+  }
+  const byScene = {};
+  pack.items.forEach((it) => {
+    const sc = it.scene || '通用';
+    if (!byScene[sc]) byScene[sc] = [];
+    byScene[sc].push(it);
+  });
+  let html = '<div class="core-card"><h4>⭐ 核心表达 · ' + escapeHtml((GOAL_META[learner.goal] || {}).label || '') + '（' + pack.items.length + '）</h4>';
+  Object.keys(byScene).forEach((sc) => {
+    html += '<div class="core-scene-title">' + escapeHtml(sc) + '</div>';
+    byScene[sc].slice(0, 40).forEach((it, idx) => {
+      html += '<div class="core-item" data-en="' + escapeHtml(it.en || '') + '">';
+      html += '<span class="pri">' + (it.priority || idx + 1) + '</span>';
+      html += '<div style="flex:1;min-width:0"><div class="en">' + escapeHtml(it.en || '') + '</div>';
+      if (it.zh) html += '<div class="zh">' + escapeHtml(it.zh) + '</div>';
+      html += '</div>';
+      html += '<div class="core-acts">';
+      html += '<button type="button" data-act="speak" title="朗读">🔊</button>';
+      html += '<button type="button" data-act="pron" title="发音">🎤</button>';
+      html += '<button type="button" data-act="memo" title="记忆法">🧠</button>';
+      html += '<button type="button" data-act="save" title="收藏">☆</button>';
+      html += '</div></div>';
+    });
+  });
+  html += '</div>';
+  el.innerHTML = html;
+  el.querySelectorAll('.core-item').forEach((row) => {
+    const en = row.dataset.en;
+    row.querySelectorAll('button').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const act = btn.dataset.act;
+        if (act === 'speak') speak(en);
+        else if (act === 'pron') coachPronunciation(en);
+        else if (act === 'memo') coachMnemonic(en);
+        else if (act === 'save') saveCorePhrase(en, row.querySelector('.zh') && row.querySelector('.zh').textContent);
+      });
+    });
+  });
+}
+
+function saveCorePhrase(en, zh) {
+  if (!en) return;
+  if (phrases.some((p) => p.en === en)) return;
+  phrases.unshift({
+    en,
+    scenarioName: '核心100 · ' + ((GOAL_META[learner.goal] || {}).label || ''),
+    mnemonic: '',
+    note: zh || '',
+    ts: Date.now(),
+    card: serializeFsrsCard(
+      ensureFsrsApi() ? window.tsfsrs.createEmptyCard(new Date()) : { due: new Date(), stability: 0, difficulty: 0, elapsed_days: 0, scheduled_days: 0, reps: 0, lapses: 0, state: 0 }
+    ),
+  });
+  persistOrWarn('dave_phrasebook', phrases);
+  renderPhrasebook();
+  updateSpeakAllBtn();
+}
+
+async function generateFourWeekPlan() {
+  if (!ensureApiKey()) return;
+  if (turnBusy) return;
+  turnBusy = true;
+  const btn = $('btn-gen-plan');
+  if (btn) { btn.disabled = true; btn.textContent = '生成中…'; }
+  try {
+    const goal = GOAL_META[learner.goal];
+    const sys = [
+      '你是英语私人导师。根据学员水平和目标，制定一份可执行的 4 周口语计划。',
+      '只输出 JSON：',
+      '{"summary":"一句话总目标","dailyHabit":"每天20分钟怎么安排（说/听/读/复习）","weeks":[{"week":1,"focus":"...","tasks":"本周具体练什么","scenarioHint":"推荐本应用里的角色或场景类型"}]}',
+      'weeks 必须正好 4 项。tasks 用中文，具体可执行。scenarioHint 要能对应工作会议/面试/客户/雅思/旅行等。',
+    ].join('\n');
+    const user = '水平：' + (LEVEL_LABEL[learner.level] || learner.level) + '\n目标：' + (goal ? goal.label + '（' + goal.coreHint + '）' : learner.goal);
+    const raw = await chatCompletion([{ role: 'user', content: user }], sys, { json: true, maxTokens: 1200 });
+    const parsed = parseJson(raw);
+    if (!parsed || !Array.isArray(parsed.weeks)) throw new Error('计划格式无效，请重试');
+    learner.plan = {
+      summary: String(parsed.summary || ''),
+      dailyHabit: String(parsed.dailyHabit || ''),
+      weeks: parsed.weeks.slice(0, 4).map((w, i) => ({
+        week: Number(w.week) || i + 1,
+        focus: String(w.focus || ''),
+        tasks: String(w.tasks || w.detail || ''),
+        scenarioHint: String(w.scenarioHint || ''),
+      })),
+      ts: Date.now(),
+      level: learner.level,
+      goal: learner.goal,
+    };
+    persistLearner();
+    renderLearnCenter();
+    addMessage('system', '✅ 4 周计划已生成，打开侧栏「学习」查看。接下来可用「今日 20 分钟」开练。', null, null);
+  } catch (err) {
+    addMessage('system', '⚠️ 生成计划失败：' + err.message, null, null);
+  } finally {
+    turnBusy = false;
+    if (btn) { btn.disabled = false; btn.textContent = '生成 4 周计划'; }
+  }
+}
+
+async function generateCore100(force) {
+  if (!ensureApiKey()) return;
+  if (!force && learner.coreByGoal[learner.goal] && learner.coreByGoal[learner.goal].items && learner.coreByGoal[learner.goal].items.length) {
+    renderCoreView();
+    switchSidebarTab('learn');
+    return;
+  }
+  if (turnBusy) return;
+  turnBusy = true;
+  const btn = $('btn-gen-core');
+  if (btn) { btn.disabled = true; btn.textContent = '生成中…'; }
+  try {
+    const goal = GOAL_META[learner.goal];
+    const sys = [
+      '你是英语词汇教练。按学员目标列出最有用的英文词和短语（优先短语）。',
+      '只输出 JSON：{"items":[{"en":"...","zh":"中文","scene":"场景名","priority":1}]}',
+      '要求：大约 100 条（90-100）；按场景分组；priority 从 1 起表示优先级（越小越先学）；en 要地道口语；面向 ' + (LEVEL_LABEL[learner.level] || '中级') + ' 学员。',
+    ].join('\n');
+    const user = '目标：' + (goal ? goal.label + ' — ' + goal.coreHint : learner.goal) + '\n请给出最有用的约 100 个词/短语。';
+    const raw = await chatCompletion([{ role: 'user', content: user }], sys, { json: true, maxTokens: 4500 });
+    const parsed = parseJson(raw);
+    const items = parsed && Array.isArray(parsed.items) ? parsed.items : null;
+    if (!items || !items.length) throw new Error('词表为空，请重试');
+    learner.coreByGoal[learner.goal] = {
+      items: items.slice(0, 100).map((it, i) => ({
+        en: String(it.en || '').trim(),
+        zh: String(it.zh || '').trim(),
+        scene: String(it.scene || '通用').trim(),
+        priority: Number(it.priority) || i + 1,
+      })).filter((it) => it.en),
+      ts: Date.now(),
+    };
+    persistLearner();
+    renderLearnCenter();
+    switchSidebarTab('learn');
+    addMessage('system', '✅ 已生成「' + (goal ? goal.label : '') + '」核心表达 ' + learner.coreByGoal[learner.goal].items.length + ' 条。', null, null);
+  } catch (err) {
+    addMessage('system', '⚠️ 生成核心词失败：' + err.message, null, null);
+  } finally {
+    turnBusy = false;
+    if (btn) { btn.disabled = false; btn.textContent = '核心 100 词'; }
+  }
+}
+
+function pickHabitPersonaScenario() {
+  const meta = GOAL_META[learner.goal] || GOAL_META.work;
+  const ids = meta.personaIds || ['dave'];
+  let persona = PERSONAS.find((p) => p.id === ids[0]) || PERSONAS[0];
+  // rotate by day among allowed personas
+  const day = Math.floor(Date.now() / 86400000);
+  persona = PERSONAS.find((p) => p.id === ids[day % ids.length]) || persona;
+  const scn = persona.scenarios[day % persona.scenarios.length];
+  return { persona, scenario: scn };
+}
+
+function markHabitDone() {
+  const today = todayKey();
+  const yesterday = (() => {
+    const d = new Date();
+    d.setDate(d.getDate() - 1);
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+  })();
+  if (learner.habit.lastDate === today && learner.habit.todayDone) {
+    // already counted
+  } else if (learner.habit.lastDate === yesterday) {
+    learner.habit.streak = (learner.habit.streak || 0) + 1;
+  } else if (learner.habit.lastDate !== today) {
+    learner.habit.streak = 1;
+  }
+  learner.habit.lastDate = today;
+  learner.habit.todayDone = true;
+  persistLearner();
+  renderLearnCenter();
+}
+
+async function startDailyHabit() {
+  if (!ensureApiKey()) return;
+  switchSidebarTab('learn');
+
+  // ensure core phrases exist (use cache if any)
+  let pack = learner.coreByGoal[learner.goal];
+  if (!pack || !pack.items || !pack.items.length) {
+    addMessage('system', '先为你生成今日要用的核心表达…', null, null);
+    await generateCore100(true);
+    pack = learner.coreByGoal[learner.goal];
+  }
+
+  const items = (pack && pack.items) ? pack.items.slice().sort((a, b) => (a.priority || 0) - (b.priority || 0)).slice(0, 5) : [];
+  const { persona, scenario } = pickHabitPersonaScenario();
+  const planHint = learner.plan && learner.plan.dailyHabit ? learner.plan.dailyHabit : '说 8 分钟 · 听 5 分钟 · 读/跟读 4 分钟 · 复习收藏 3 分钟';
+
+  // show habit card in chat
+  const card = document.createElement('div');
+  card.className = 'msg system';
+  const box = document.createElement('div');
+  box.className = 'habit-card';
+  let body = '<h4>⏱ 今日 20 分钟习惯</h4>';
+  body += '<div>水平 ' + escapeHtml(LEVEL_LABEL[learner.level] || '') + ' · 目标 ' + escapeHtml((GOAL_META[learner.goal] || {}).label || '') + '</div>';
+  body += '<ul class="habit-steps">';
+  body += '<li><b>0–3 分 · 听读</b>：跟读下面 5 个高优先级表达</li>';
+  const dueN = getReviewStats().due;
+  body += '<li><b>复习</b>：收藏里 FSRS 待复习 <b>' + dueN + '</b> 张' + (dueN ? '（点「开始复习」）' : '') + '</li>';
+  body += '<li><b>3–15 分 · 真对话</b>：进入「' + escapeHtml(persona.name) + ' · ' + escapeHtml(scenario.name) + '」立刻纠错</li>';
+  body += '<li><b>15–20 分 · 复盘</b>：点「结束复盘」巩固今日表达</li>';
+  body += '</ul>';
+  body += '<div style="margin-top:8px;color:var(--muted)">建议节奏：' + escapeHtml(planHint) + '</div>';
+  if (items.length) {
+    body += '<div style="margin-top:10px"><b>今日 5 词</b></div>';
+    items.forEach((it, i) => {
+      body += '<div class="core-item" style="border:none;padding:4px 0"><span class="pri">' + (i + 1) + '</span><div><div class="en">' + escapeHtml(it.en) + '</div><div class="zh">' + escapeHtml(it.zh || '') + '</div></div></div>';
+    });
+  }
+  box.innerHTML = body;
+  const actions = document.createElement('div');
+  actions.className = 'corr-actions';
+  const speakWarm = document.createElement('button');
+  speakWarm.type = 'button';
+  speakWarm.className = 'mini-btn';
+  speakWarm.textContent = '🔊 跟读今日 5 词';
+  speakWarm.addEventListener('click', () => {
+    items.forEach((it) => { if (it.en) speakQueue.push(it.en); });
+    if (!speakingAll) drainSpeakQueueFromHabit();
+  });
+  const goPractice = document.createElement('button');
+  goPractice.type = 'button';
+  goPractice.className = 'mini-btn';
+  goPractice.textContent = '开始真对话 →';
+  goPractice.addEventListener('click', () => {
+    personaSelect.value = persona.id;
+    currentPersona = persona;
+    $('brand-avatar').textContent = persona.icon;
+    renderScenarioOptions();
+    startSession(scenario.id);
+    markHabitDone();
+  });
+  const doneBtn = document.createElement('button');
+  doneBtn.type = 'button';
+  doneBtn.className = 'mini-btn';
+  doneBtn.textContent = '标记今日完成';
+  doneBtn.addEventListener('click', () => {
+    markHabitDone();
+    addMessage('system', '✅ 今日 20 分钟已记上。连续 ' + learner.habit.streak + ' 天。', null, null);
+  });
+  actions.appendChild(speakWarm);
+  actions.appendChild(goPractice);
+  actions.appendChild(doneBtn);
+  box.appendChild(actions);
+  card.appendChild(box);
+  if (welcomeEl) welcomeEl.classList.add('hidden');
+  chatEl.appendChild(card);
+  scrollToBottom();
+  closeMobileDrawer();
+}
+
+function drainSpeakQueueFromHabit() {
+  if (!speakQueue.length || !window.speechSynthesis) return;
+  speakListenId += 1;
+  cancelHandsfreeListen();
+  ttsGen += 1;
+  const gen = ttsGen;
+  speakingAll = true;
+  updateSpeakAllBtn();
+  startTtsWatchdog();
+  try { speechSynthesis.cancel(); } catch (e) { /* ignore */ }
+  setTimeout(() => drainSpeakQueue(gen), 80);
 }
 
 /* ---------------------------- 语音输出 ------------------------------ */
@@ -1472,31 +2065,269 @@ function restoreSession(h) {
   inputEl.focus();
 }
 
+/* ---------------------------- FSRS 复习 ------------------------------ */
+let reviewQueue = [];
+let reviewIdx = 0;
+let reviewActive = false;
+
+function phraseDueDate(p) {
+  const c = hydrateFsrsCard(p.card);
+  return c.due;
+}
+
+function isPhraseDue(p, now) {
+  const due = phraseDueDate(p);
+  return due.getTime() <= (now || Date.now());
+}
+
+function isPhraseNew(p) {
+  const c = hydrateFsrsCard(p.card);
+  return (c.state === 0 && c.reps === 0) || (window.tsfsrs && c.state === window.tsfsrs.State.New && c.reps === 0);
+}
+
+function getReviewStats() {
+  const now = Date.now();
+  let due = 0;
+  let neu = 0;
+  phrases.forEach((p) => {
+    if (isPhraseNew(p)) neu += 1;
+    if (isPhraseDue(p, now)) due += 1;
+  });
+  return { due, neu, total: phrases.length };
+}
+
+function formatDueLabel(p) {
+  const c = hydrateFsrsCard(p.card);
+  if (isPhraseNew(p)) return { text: '新卡 · 待学', cls: 'due-new' };
+  const now = Date.now();
+  const diffMs = c.due.getTime() - now;
+  if (diffMs <= 0) return { text: '到期 · 该复习了', cls: 'due-now' };
+  const mins = Math.round(diffMs / 60000);
+  if (mins < 60) return { text: mins + ' 分钟后', cls: '' };
+  const hours = Math.round(mins / 60);
+  if (hours < 48) return { text: hours + ' 小时后', cls: '' };
+  const days = Math.round(hours / 24);
+  return { text: days + ' 天后', cls: '' };
+}
+
+function buildDueQueue() {
+  const now = Date.now();
+  return phrases
+    .map((p, idx) => ({ p, idx, due: phraseDueDate(p).getTime() }))
+    .filter((x) => x.due <= now)
+    .sort((a, b) => a.due - b.due);
+}
+
+function updateReviewStatsUi() {
+  const el = $('review-stats');
+  const btn = $('btn-start-review');
+  if (!el) return;
+  const s = getReviewStats();
+  el.innerHTML = '待复习 <strong>' + s.due + '</strong> · 新卡 ' + s.neu + ' · 共 ' + s.total;
+  if (btn) {
+    btn.disabled = s.due === 0;
+    btn.textContent = reviewActive ? '结束复习' : (s.due ? '开始复习 (' + s.due + ')' : '暂无到期');
+  }
+}
+
+function stopReviewSession() {
+  reviewActive = false;
+  reviewQueue = [];
+  reviewIdx = 0;
+  const stage = $('review-stage');
+  if (stage) {
+    stage.classList.add('hidden');
+    stage.innerHTML = '';
+  }
+  updateReviewStatsUi();
+}
+
+function startReviewSession() {
+  if (!ensureFsrsApi()) {
+    addMessage('system', 'FSRS 还在加载，请稍后再点「开始复习」。', null, null);
+    return;
+  }
+  if (reviewActive) {
+    stopReviewSession();
+    return;
+  }
+  reviewQueue = buildDueQueue();
+  if (!reviewQueue.length) {
+    addMessage('system', '今天没有到期卡片。先收藏几句地道表达，或稍后再来。', null, null);
+    updateReviewStatsUi();
+    return;
+  }
+  reviewActive = true;
+  reviewIdx = 0;
+  switchSidebarTab('phrasebook');
+  renderCurrentReviewCard();
+  updateReviewStatsUi();
+}
+
+function renderCurrentReviewCard() {
+  const stage = $('review-stage');
+  if (!stage) return;
+  if (!reviewActive || reviewIdx >= reviewQueue.length) {
+    stopReviewSession();
+    addMessage('system', '✅ 本轮复习完成。', null, null);
+    renderPhrasebook();
+    return;
+  }
+  const item = reviewQueue[reviewIdx];
+  const p = phrases[item.idx];
+  if (!p) {
+    reviewIdx += 1;
+    renderCurrentReviewCard();
+    return;
+  }
+  const card = hydrateFsrsCard(p.card);
+  const preview = window.tsfsrs.scheduler.repeat(card, new Date());
+  const Rating = window.tsfsrs.Rating;
+  const dueHint = (rating) => {
+    const next = preview[rating].card;
+    const mins = Math.max(0, Math.round((next.due.getTime() - Date.now()) / 60000));
+    if (mins < 60) return mins + ' 分钟后';
+    const h = Math.round(mins / 60);
+    if (h < 48) return h + ' 小时后';
+    return Math.round(h / 24) + ' 天后';
+  };
+
+  stage.classList.remove('hidden');
+  stage.innerHTML = '';
+  const label = document.createElement('div');
+  label.className = 'rv-label';
+  label.textContent = 'FSRS 复习 ' + (reviewIdx + 1) + ' / ' + reviewQueue.length +
+    (isPhraseNew(p) ? ' · 新卡' : ' · 复习');
+  const en = document.createElement('div');
+  en.className = 'rv-en';
+  en.textContent = p.en;
+  const meta = document.createElement('div');
+  meta.className = 'rv-meta';
+  meta.textContent = (p.scenarioName || '') + (p.note ? ' · ' + p.note : '');
+  stage.appendChild(label);
+  stage.appendChild(en);
+  stage.appendChild(meta);
+  if (p.mnemonic) {
+    const hint = document.createElement('div');
+    hint.className = 'rv-hint';
+    hint.textContent = '🧠 ' + p.mnemonic;
+    stage.appendChild(hint);
+  }
+  const speakRow = document.createElement('div');
+  speakRow.style.marginBottom = '10px';
+  const spk = document.createElement('button');
+  spk.type = 'button';
+  spk.className = 'btn btn-ghost';
+  spk.textContent = '🔊 朗读 / 跟读';
+  spk.addEventListener('click', () => speak(p.en));
+  speakRow.appendChild(spk);
+  stage.appendChild(speakRow);
+
+  const grades = document.createElement('div');
+  grades.className = 'review-grades';
+  const mk = (cls, title, sub, rating) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'g-btn ' + cls;
+    b.innerHTML = title + '<small>' + sub + ' · ' + dueHint(rating) + '</small>';
+    b.addEventListener('click', () => rateCurrentReview(rating));
+    return b;
+  };
+  grades.appendChild(mk('g-again', 'Again 忘记', '重来', Rating.Again));
+  grades.appendChild(mk('g-hard', 'Hard 勉强', '有点难', Rating.Hard));
+  grades.appendChild(mk('g-good', 'Good 记得', '正常', Rating.Good));
+  grades.appendChild(mk('g-easy', 'Easy 太熟', '轻松', Rating.Easy));
+  stage.appendChild(grades);
+  speak(p.en);
+}
+
+function rateCurrentReview(rating) {
+  if (!reviewActive || !ensureFsrsApi()) return;
+  const item = reviewQueue[reviewIdx];
+  if (!item) return;
+  const p = phrases[item.idx];
+  if (!p) return;
+  const now = new Date();
+  const current = hydrateFsrsCard(p.card);
+  const result = window.tsfsrs.scheduler.next(current, now, rating);
+  p.card = serializeFsrsCard(result.card);
+  persistOrWarn('dave_phrasebook', phrases);
+  reviewIdx += 1;
+  renderPhrasebook();
+  renderCurrentReviewCard();
+}
+
 function renderPhrasebook() {
   const el = $('phrasebook-list');
   updateSpeakAllBtn();
-  if (!phrases.length) { el.innerHTML = '<div class="empty">还没有收藏。点纠错卡片的 ☆ 收藏地道表达。</div>'; return; }
+  updateReviewStatsUi();
+  if (!phrases.length) {
+    el.innerHTML = '<div class="empty">还没有收藏。点纠错卡片的 ☆ 收藏地道表达，再用 FSRS 复习。</div>';
+    return;
+  }
   el.innerHTML = '';
-  phrases.forEach((p, idx) => {
+  // due first
+  const ordered = phrases
+    .map((p, idx) => ({ p, idx, due: phraseDueDate(p).getTime() }))
+    .sort((a, b) => a.due - b.due);
+
+  ordered.forEach(({ p, idx }) => {
     const card = document.createElement('div');
     card.className = 'phrase-card';
     card.innerHTML = `<div class="en">${escapeHtml(p.en)}</div>`;
+    if (p.note) {
+      const note = document.createElement('div');
+      note.className = 'zh';
+      note.style.cssText = 'color:var(--muted);font-size:12px;margin-top:2px';
+      note.textContent = p.note;
+      card.appendChild(note);
+    }
+    if (p.mnemonic) {
+      const mem = document.createElement('div');
+      mem.className = 'mnemonic';
+      mem.textContent = '🧠 ' + p.mnemonic;
+      card.appendChild(mem);
+    }
+    const due = formatDueLabel(p);
+    const dueEl = document.createElement('div');
+    dueEl.className = 'due ' + due.cls;
+    dueEl.textContent = '📅 ' + due.text;
+    card.appendChild(dueEl);
+
     const meta = document.createElement('div');
     meta.className = 'meta';
     meta.innerHTML = `<span>${escapeHtml(p.scenarioName || '')}</span>`;
     const actions = document.createElement('span');
+    actions.className = 'p-acts';
     const spk = document.createElement('button');
     spk.className = 'speak'; spk.textContent = '🔊'; spk.title = '朗读';
     spk.addEventListener('click', () => speak(p.en));
+    const pron = document.createElement('button');
+    pron.textContent = '发音'; pron.title = '练发音';
+    pron.addEventListener('click', () => coachPronunciation(p.en));
+    const memo = document.createElement('button');
+    memo.textContent = '记忆法'; memo.title = '一次记住';
+    memo.addEventListener('click', async () => {
+      const tip = await coachMnemonic(p.en);
+      if (tip && !tip.startsWith('生成失败')) {
+        phrases[idx].mnemonic = tip.slice(0, 280);
+        persistOrWarn('dave_phrasebook', phrases);
+        renderPhrasebook();
+      }
+    });
     const del = document.createElement('button');
     del.className = 'del'; del.textContent = '删除';
     del.addEventListener('click', () => {
       phrases.splice(idx, 1);
       persistOrWarn('dave_phrasebook', phrases);
+      if (reviewActive) stopReviewSession();
       renderPhrasebook();
       updateSpeakAllBtn();
     });
-    actions.appendChild(spk); actions.appendChild(del);
+    actions.appendChild(spk);
+    actions.appendChild(pron);
+    actions.appendChild(memo);
+    actions.appendChild(del);
     meta.appendChild(actions);
     card.appendChild(meta);
     el.appendChild(card);
@@ -1630,6 +2461,7 @@ function bindEvents() {
   $('btn-mic').addEventListener('click', toggleMic);
   $('btn-new').addEventListener('click', () => { startSession(scenarioSelect.value || currentPersona.scenarios[0].id); });
   $('btn-review').addEventListener('click', endReview);
+  if ($('btn-habit')) $('btn-habit').addEventListener('click', () => startDailyHabit());
 
   $('btn-settings').addEventListener('click', openSettings);
   $('btn-close-settings').addEventListener('click', closeSettings);
@@ -1639,6 +2471,30 @@ function bindEvents() {
   $('settings-overlay').addEventListener('click', (e) => {
     if (e.target === $('settings-overlay')) closeSettings();
   });
+
+  if ($('btn-close-coach')) $('btn-close-coach').addEventListener('click', closeCoachModal);
+  if ($('btn-close-coach-2')) $('btn-close-coach-2').addEventListener('click', closeCoachModal);
+  if ($('coach-overlay')) {
+    $('coach-overlay').addEventListener('click', (e) => {
+      if (e.target === $('coach-overlay')) closeCoachModal();
+    });
+  }
+  if ($('btn-coach-speak')) {
+    $('btn-coach-speak').addEventListener('click', () => {
+      if (coachSpeakText) speak(coachSpeakText);
+    });
+  }
+
+  document.querySelectorAll('#level-seg .seg-btn').forEach((btn) => {
+    btn.addEventListener('click', () => setLearnerLevel(btn.dataset.level));
+  });
+  document.querySelectorAll('#goal-seg .seg-btn').forEach((btn) => {
+    btn.addEventListener('click', () => setLearnerGoal(btn.dataset.goal));
+  });
+  if ($('btn-gen-plan')) $('btn-gen-plan').addEventListener('click', () => generateFourWeekPlan());
+  if ($('btn-gen-core')) $('btn-gen-core').addEventListener('click', () => generateCore100(false));
+  if ($('btn-start-habit')) $('btn-start-habit').addEventListener('click', () => startDailyHabit());
+  if ($('btn-start-review')) $('btn-start-review').addEventListener('click', () => startReviewSession());
 
   document.querySelectorAll('.preset').forEach((btn) => {
     btn.addEventListener('click', () => {
@@ -1670,11 +2526,13 @@ function bindEvents() {
 
 function switchSidebarTab(name) {
   document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === name));
+  if ($('tab-learn')) $('tab-learn').classList.toggle('hidden', name !== 'learn');
   $('tab-phrasebook').classList.toggle('hidden', name !== 'phrasebook');
   $('tab-history').classList.toggle('hidden', name !== 'history');
   document.querySelectorAll('.dock-btn').forEach((b) => {
     b.classList.toggle('active', b.dataset.openTab === name);
   });
+  if (name === 'learn') renderLearnCenter();
 }
 
 function openMobileDrawer(tabName) {
@@ -1709,14 +2567,24 @@ function init() {
   renderPersonaOptions();
   renderScenarioOptions();
   renderWelcome();
+  renderLearnCenter();
   renderPhrasebook();
   renderHistory();
   bindEvents();
   updateSpeakAllBtn();
   updateMicStatus();
-  // 未配置 Key 时给个提示（欢迎列表仍可见）
+  waitForFsrs(5000).then((ok) => {
+    if (ok) {
+      // re-hydrate any cards that were created before FSRS loaded
+      phrases = sanitizePhraseList(phrases);
+      persistOrWarn('dave_phrasebook', phrases);
+      renderPhrasebook();
+    }
+  });
   if (!config.key) {
-    addMessage('system', '👋 欢迎。先点右上角「⚙ 设置」填入你的 API Key（DeepSeek / OpenAI 均可），再选角色和场景开始。', null, null);
+    addMessage('system', '👋 欢迎。先点右上角「⚙ 设置」填入 API Key，再到侧栏「学习」定级/定目标，或直接选场景开练。', null, null);
+  } else if (!learner.plan) {
+    addMessage('system', '💡 打开侧栏「学习」：选水平与目标 → 生成 4 周计划 → 用「今日 20 分钟」开练。收藏表达可用 FSRS 间隔复习。', null, null);
   }
 }
 
