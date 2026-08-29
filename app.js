@@ -435,7 +435,88 @@ function sanitizePhraseItem(p) {
     mnemonic: p.mnemonic ? String(p.mnemonic) : '',
     note: p.note ? String(p.note) : '',
     ts: Number.isFinite(ts) ? ts : Date.now(),
+    card: sanitizeFsrsCard(p.card, ts),
   };
+}
+
+function sanitizeFsrsCard(raw, fallbackTs) {
+  const now = new Date(Number.isFinite(fallbackTs) ? fallbackTs : Date.now());
+  const base = ensureFsrsApi()
+    ? window.tsfsrs.createEmptyCard(now)
+    : {
+        due: now,
+        stability: 0,
+        difficulty: 0,
+        elapsed_days: 0,
+        scheduled_days: 0,
+        reps: 0,
+        lapses: 0,
+        state: 0,
+        last_review: undefined,
+      };
+  if (!raw || typeof raw !== 'object') return serializeFsrsCard(base);
+  return serializeFsrsCard({
+    due: raw.due ? new Date(raw.due) : base.due,
+    stability: Number(raw.stability) || 0,
+    difficulty: Number(raw.difficulty) || 0,
+    elapsed_days: Number(raw.elapsed_days) || 0,
+    scheduled_days: Number(raw.scheduled_days) || 0,
+    reps: Number(raw.reps) || 0,
+    lapses: Number(raw.lapses) || 0,
+    state: Number(raw.state) || 0,
+    last_review: raw.last_review ? new Date(raw.last_review) : undefined,
+  });
+}
+
+function serializeFsrsCard(card) {
+  return {
+    due: card.due instanceof Date ? card.due.toISOString() : String(card.due),
+    stability: Number(card.stability) || 0,
+    difficulty: Number(card.difficulty) || 0,
+    elapsed_days: Number(card.elapsed_days) || 0,
+    scheduled_days: Number(card.scheduled_days) || 0,
+    reps: Number(card.reps) || 0,
+    lapses: Number(card.lapses) || 0,
+    state: Number(card.state) || 0,
+    last_review: card.last_review
+      ? (card.last_review instanceof Date ? card.last_review.toISOString() : String(card.last_review))
+      : undefined,
+  };
+}
+
+function hydrateFsrsCard(stored) {
+  const c = sanitizeFsrsCard(stored);
+  return {
+    due: new Date(c.due),
+    stability: c.stability,
+    difficulty: c.difficulty,
+    elapsed_days: c.elapsed_days,
+    scheduled_days: c.scheduled_days,
+    reps: c.reps,
+    lapses: c.lapses,
+    state: c.state,
+    last_review: c.last_review ? new Date(c.last_review) : undefined,
+  };
+}
+
+function ensureFsrsApi() {
+  return !!(window.tsfsrs && window.tsfsrs.scheduler && window.tsfsrs.Rating);
+}
+
+function waitForFsrs(timeoutMs) {
+  if (ensureFsrsApi()) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const t = setTimeout(() => {
+      window.removeEventListener('tsfsrs-ready', onReady);
+      resolve(ensureFsrsApi());
+    }, timeoutMs || 4000);
+    function onReady() {
+      clearTimeout(t);
+      window.removeEventListener('tsfsrs-ready', onReady);
+      resolve(ensureFsrsApi());
+    }
+    window.addEventListener('tsfsrs-ready', onReady);
+  });
 }
 
 function sanitizePhraseList(list) {
@@ -599,7 +680,14 @@ function buildCorrectionCard(correction, focus) {
     } else {
       star.textContent = '★';
       star.classList.add('starred');
-      phrases.unshift({ en: better, scenarioName: scn ? scn.name : currentPersona.name, ts: Date.now() });
+      phrases.unshift({
+        en: better,
+        scenarioName: scn ? scn.name : currentPersona.name,
+        ts: Date.now(),
+        card: serializeFsrsCard(
+          ensureFsrsApi() ? window.tsfsrs.createEmptyCard(new Date()) : { due: new Date(), stability: 0, difficulty: 0, elapsed_days: 0, scheduled_days: 0, reps: 0, lapses: 0, state: 0 }
+        ),
+      });
     }
     persistOrWarn('dave_phrasebook', phrases);
     renderPhrasebook();
@@ -1317,6 +1405,9 @@ function saveCorePhrase(en, zh) {
     mnemonic: '',
     note: zh || '',
     ts: Date.now(),
+    card: serializeFsrsCard(
+      ensureFsrsApi() ? window.tsfsrs.createEmptyCard(new Date()) : { due: new Date(), stability: 0, difficulty: 0, elapsed_days: 0, scheduled_days: 0, reps: 0, lapses: 0, state: 0 }
+    ),
   });
   persistOrWarn('dave_phrasebook', phrases);
   renderPhrasebook();
@@ -1465,8 +1556,10 @@ async function startDailyHabit() {
   body += '<div>水平 ' + escapeHtml(LEVEL_LABEL[learner.level] || '') + ' · 目标 ' + escapeHtml((GOAL_META[learner.goal] || {}).label || '') + '</div>';
   body += '<ul class="habit-steps">';
   body += '<li><b>0–3 分 · 听读</b>：跟读下面 5 个高优先级表达</li>';
+  const dueN = getReviewStats().due;
+  body += '<li><b>复习</b>：收藏里 FSRS 待复习 <b>' + dueN + '</b> 张' + (dueN ? '（点「开始复习」）' : '') + '</li>';
   body += '<li><b>3–15 分 · 真对话</b>：进入「' + escapeHtml(persona.name) + ' · ' + escapeHtml(scenario.name) + '」立刻纠错</li>';
-  body += '<li><b>15–20 分 · 复习</b>：点「结束复盘」+ 收藏里朗读</li>';
+  body += '<li><b>15–20 分 · 复盘</b>：点「结束复盘」巩固今日表达</li>';
   body += '</ul>';
   body += '<div style="margin-top:8px;color:var(--muted)">建议节奏：' + escapeHtml(planHint) + '</div>';
   if (items.length) {
@@ -1972,12 +2065,213 @@ function restoreSession(h) {
   inputEl.focus();
 }
 
+/* ---------------------------- FSRS 复习 ------------------------------ */
+let reviewQueue = [];
+let reviewIdx = 0;
+let reviewActive = false;
+
+function phraseDueDate(p) {
+  const c = hydrateFsrsCard(p.card);
+  return c.due;
+}
+
+function isPhraseDue(p, now) {
+  const due = phraseDueDate(p);
+  return due.getTime() <= (now || Date.now());
+}
+
+function isPhraseNew(p) {
+  const c = hydrateFsrsCard(p.card);
+  return (c.state === 0 && c.reps === 0) || (window.tsfsrs && c.state === window.tsfsrs.State.New && c.reps === 0);
+}
+
+function getReviewStats() {
+  const now = Date.now();
+  let due = 0;
+  let neu = 0;
+  phrases.forEach((p) => {
+    if (isPhraseNew(p)) neu += 1;
+    if (isPhraseDue(p, now)) due += 1;
+  });
+  return { due, neu, total: phrases.length };
+}
+
+function formatDueLabel(p) {
+  const c = hydrateFsrsCard(p.card);
+  if (isPhraseNew(p)) return { text: '新卡 · 待学', cls: 'due-new' };
+  const now = Date.now();
+  const diffMs = c.due.getTime() - now;
+  if (diffMs <= 0) return { text: '到期 · 该复习了', cls: 'due-now' };
+  const mins = Math.round(diffMs / 60000);
+  if (mins < 60) return { text: mins + ' 分钟后', cls: '' };
+  const hours = Math.round(mins / 60);
+  if (hours < 48) return { text: hours + ' 小时后', cls: '' };
+  const days = Math.round(hours / 24);
+  return { text: days + ' 天后', cls: '' };
+}
+
+function buildDueQueue() {
+  const now = Date.now();
+  return phrases
+    .map((p, idx) => ({ p, idx, due: phraseDueDate(p).getTime() }))
+    .filter((x) => x.due <= now)
+    .sort((a, b) => a.due - b.due);
+}
+
+function updateReviewStatsUi() {
+  const el = $('review-stats');
+  const btn = $('btn-start-review');
+  if (!el) return;
+  const s = getReviewStats();
+  el.innerHTML = '待复习 <strong>' + s.due + '</strong> · 新卡 ' + s.neu + ' · 共 ' + s.total;
+  if (btn) {
+    btn.disabled = s.due === 0;
+    btn.textContent = reviewActive ? '结束复习' : (s.due ? '开始复习 (' + s.due + ')' : '暂无到期');
+  }
+}
+
+function stopReviewSession() {
+  reviewActive = false;
+  reviewQueue = [];
+  reviewIdx = 0;
+  const stage = $('review-stage');
+  if (stage) {
+    stage.classList.add('hidden');
+    stage.innerHTML = '';
+  }
+  updateReviewStatsUi();
+}
+
+function startReviewSession() {
+  if (!ensureFsrsApi()) {
+    addMessage('system', 'FSRS 还在加载，请稍后再点「开始复习」。', null, null);
+    return;
+  }
+  if (reviewActive) {
+    stopReviewSession();
+    return;
+  }
+  reviewQueue = buildDueQueue();
+  if (!reviewQueue.length) {
+    addMessage('system', '今天没有到期卡片。先收藏几句地道表达，或稍后再来。', null, null);
+    updateReviewStatsUi();
+    return;
+  }
+  reviewActive = true;
+  reviewIdx = 0;
+  switchSidebarTab('phrasebook');
+  renderCurrentReviewCard();
+  updateReviewStatsUi();
+}
+
+function renderCurrentReviewCard() {
+  const stage = $('review-stage');
+  if (!stage) return;
+  if (!reviewActive || reviewIdx >= reviewQueue.length) {
+    stopReviewSession();
+    addMessage('system', '✅ 本轮复习完成。', null, null);
+    renderPhrasebook();
+    return;
+  }
+  const item = reviewQueue[reviewIdx];
+  const p = phrases[item.idx];
+  if (!p) {
+    reviewIdx += 1;
+    renderCurrentReviewCard();
+    return;
+  }
+  const card = hydrateFsrsCard(p.card);
+  const preview = window.tsfsrs.scheduler.repeat(card, new Date());
+  const Rating = window.tsfsrs.Rating;
+  const dueHint = (rating) => {
+    const next = preview[rating].card;
+    const mins = Math.max(0, Math.round((next.due.getTime() - Date.now()) / 60000));
+    if (mins < 60) return mins + ' 分钟后';
+    const h = Math.round(mins / 60);
+    if (h < 48) return h + ' 小时后';
+    return Math.round(h / 24) + ' 天后';
+  };
+
+  stage.classList.remove('hidden');
+  stage.innerHTML = '';
+  const label = document.createElement('div');
+  label.className = 'rv-label';
+  label.textContent = 'FSRS 复习 ' + (reviewIdx + 1) + ' / ' + reviewQueue.length +
+    (isPhraseNew(p) ? ' · 新卡' : ' · 复习');
+  const en = document.createElement('div');
+  en.className = 'rv-en';
+  en.textContent = p.en;
+  const meta = document.createElement('div');
+  meta.className = 'rv-meta';
+  meta.textContent = (p.scenarioName || '') + (p.note ? ' · ' + p.note : '');
+  stage.appendChild(label);
+  stage.appendChild(en);
+  stage.appendChild(meta);
+  if (p.mnemonic) {
+    const hint = document.createElement('div');
+    hint.className = 'rv-hint';
+    hint.textContent = '🧠 ' + p.mnemonic;
+    stage.appendChild(hint);
+  }
+  const speakRow = document.createElement('div');
+  speakRow.style.marginBottom = '10px';
+  const spk = document.createElement('button');
+  spk.type = 'button';
+  spk.className = 'btn btn-ghost';
+  spk.textContent = '🔊 朗读 / 跟读';
+  spk.addEventListener('click', () => speak(p.en));
+  speakRow.appendChild(spk);
+  stage.appendChild(speakRow);
+
+  const grades = document.createElement('div');
+  grades.className = 'review-grades';
+  const mk = (cls, title, sub, rating) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'g-btn ' + cls;
+    b.innerHTML = title + '<small>' + sub + ' · ' + dueHint(rating) + '</small>';
+    b.addEventListener('click', () => rateCurrentReview(rating));
+    return b;
+  };
+  grades.appendChild(mk('g-again', 'Again 忘记', '重来', Rating.Again));
+  grades.appendChild(mk('g-hard', 'Hard 勉强', '有点难', Rating.Hard));
+  grades.appendChild(mk('g-good', 'Good 记得', '正常', Rating.Good));
+  grades.appendChild(mk('g-easy', 'Easy 太熟', '轻松', Rating.Easy));
+  stage.appendChild(grades);
+  speak(p.en);
+}
+
+function rateCurrentReview(rating) {
+  if (!reviewActive || !ensureFsrsApi()) return;
+  const item = reviewQueue[reviewIdx];
+  if (!item) return;
+  const p = phrases[item.idx];
+  if (!p) return;
+  const now = new Date();
+  const current = hydrateFsrsCard(p.card);
+  const result = window.tsfsrs.scheduler.next(current, now, rating);
+  p.card = serializeFsrsCard(result.card);
+  persistOrWarn('dave_phrasebook', phrases);
+  reviewIdx += 1;
+  renderPhrasebook();
+  renderCurrentReviewCard();
+}
+
 function renderPhrasebook() {
   const el = $('phrasebook-list');
   updateSpeakAllBtn();
-  if (!phrases.length) { el.innerHTML = '<div class="empty">还没有收藏。点纠错卡片的 ☆ 收藏地道表达。</div>'; return; }
+  updateReviewStatsUi();
+  if (!phrases.length) {
+    el.innerHTML = '<div class="empty">还没有收藏。点纠错卡片的 ☆ 收藏地道表达，再用 FSRS 复习。</div>';
+    return;
+  }
   el.innerHTML = '';
-  phrases.forEach((p, idx) => {
+  // due first
+  const ordered = phrases
+    .map((p, idx) => ({ p, idx, due: phraseDueDate(p).getTime() }))
+    .sort((a, b) => a.due - b.due);
+
+  ordered.forEach(({ p, idx }) => {
     const card = document.createElement('div');
     card.className = 'phrase-card';
     card.innerHTML = `<div class="en">${escapeHtml(p.en)}</div>`;
@@ -1994,6 +2288,12 @@ function renderPhrasebook() {
       mem.textContent = '🧠 ' + p.mnemonic;
       card.appendChild(mem);
     }
+    const due = formatDueLabel(p);
+    const dueEl = document.createElement('div');
+    dueEl.className = 'due ' + due.cls;
+    dueEl.textContent = '📅 ' + due.text;
+    card.appendChild(dueEl);
+
     const meta = document.createElement('div');
     meta.className = 'meta';
     meta.innerHTML = `<span>${escapeHtml(p.scenarioName || '')}</span>`;
@@ -2020,6 +2320,7 @@ function renderPhrasebook() {
     del.addEventListener('click', () => {
       phrases.splice(idx, 1);
       persistOrWarn('dave_phrasebook', phrases);
+      if (reviewActive) stopReviewSession();
       renderPhrasebook();
       updateSpeakAllBtn();
     });
@@ -2193,6 +2494,7 @@ function bindEvents() {
   if ($('btn-gen-plan')) $('btn-gen-plan').addEventListener('click', () => generateFourWeekPlan());
   if ($('btn-gen-core')) $('btn-gen-core').addEventListener('click', () => generateCore100(false));
   if ($('btn-start-habit')) $('btn-start-habit').addEventListener('click', () => startDailyHabit());
+  if ($('btn-start-review')) $('btn-start-review').addEventListener('click', () => startReviewSession());
 
   document.querySelectorAll('.preset').forEach((btn) => {
     btn.addEventListener('click', () => {
@@ -2271,10 +2573,18 @@ function init() {
   bindEvents();
   updateSpeakAllBtn();
   updateMicStatus();
+  waitForFsrs(5000).then((ok) => {
+    if (ok) {
+      // re-hydrate any cards that were created before FSRS loaded
+      phrases = sanitizePhraseList(phrases);
+      persistOrWarn('dave_phrasebook', phrases);
+      renderPhrasebook();
+    }
+  });
   if (!config.key) {
     addMessage('system', '👋 欢迎。先点右上角「⚙ 设置」填入 API Key，再到侧栏「学习」定级/定目标，或直接选场景开练。', null, null);
   } else if (!learner.plan) {
-    addMessage('system', '💡 打开侧栏「学习」：选水平与目标 → 生成 4 周计划 → 用「今日 20 分钟」开练。', null, null);
+    addMessage('system', '💡 打开侧栏「学习」：选水平与目标 → 生成 4 周计划 → 用「今日 20 分钟」开练。收藏表达可用 FSRS 间隔复习。', null, null);
   }
 }
 

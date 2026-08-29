@@ -89,9 +89,14 @@
 
         <div id="tab-phrasebook" class="tab-panel hidden">
           <div class="tab-head-row">
-            <p class="tab-hint">点纠错卡片上的 ☆ 收藏地道表达；可加记忆法 / 练发音。</p>
+            <p class="tab-hint">收藏用 FSRS 间隔复习（同 Anki 算法）。点 ☆ 收藏后会出现在复习队列。</p>
             <button id="btn-speak-all" class="btn btn-ghost btn-speak-all" type="button">朗读全部</button>
           </div>
+          <div class="review-bar">
+            <div id="review-stats" class="review-stats">待复习 0 · 新卡 0</div>
+            <button id="btn-start-review" class="btn btn-primary" type="button">开始复习</button>
+          </div>
+          <div id="review-stage" class="review-stage hidden"></div>
           <div id="phrasebook-list" class="card-list"></div>
         </div>
 
@@ -183,6 +188,7 @@
     </div>
   </div>
 
+  <script type="module" src="fsrs-bridge.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

@@ -358,6 +358,58 @@ html, body {
 .history-card { cursor: pointer; }
 .history-card:hover { border-color: var(--accent); }
 
+.review-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; margin-bottom: 12px;
+  padding: 10px 12px;
+  background: rgba(79,124,255,.08);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.review-stats { font-size: 12.5px; color: var(--muted); line-height: 1.4; }
+.review-stats strong { color: var(--warn); }
+.review-stage {
+  background: var(--panel-2);
+  border: 1px solid var(--accent-soft);
+  border-radius: 12px;
+  padding: 14px;
+  margin-bottom: 12px;
+}
+.review-stage .rv-label { font-size: 11.5px; color: var(--muted); margin-bottom: 8px; }
+.review-stage .rv-en {
+  font-size: 18px; font-weight: 650; color: #c6f5e3;
+  line-height: 1.45; margin-bottom: 8px;
+}
+.review-stage .rv-meta { font-size: 12px; color: var(--muted); margin-bottom: 12px; }
+.review-stage .rv-hint {
+  font-size: 12.5px; color: var(--text);
+  background: rgba(240,168,60,.08);
+  border-radius: 8px; padding: 8px 10px; margin-bottom: 12px;
+  white-space: pre-wrap;
+}
+.review-grades { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.review-grades .g-btn {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 10px 8px;
+  cursor: pointer;
+  font-size: 13px; font-weight: 650;
+}
+.review-grades .g-btn small {
+  display: block; font-weight: 500; color: var(--muted);
+  font-size: 11px; margin-top: 3px;
+}
+.review-grades .g-again { border-color: #6b2a32; color: #f2c9cd; }
+.review-grades .g-hard { border-color: #6b4e22; color: #f0d2a0; }
+.review-grades .g-good { border-color: #1f3d34; color: #c6f5e3; }
+.review-grades .g-easy { border-color: var(--accent-soft); color: #b8ccff; }
+.review-grades .g-btn:hover { filter: brightness(1.12); }
+.phrase-card .due { font-size: 11px; color: var(--muted); margin-top: 4px; }
+.phrase-card .due.due-now { color: var(--warn); }
+.phrase-card .due.due-new { color: var(--accent); }
+
 .empty { color: var(--muted); font-size: 13px; text-align: center; padding: 24px 0; }
 
 /* ===== 弹窗 ===== */
