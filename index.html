@@ -38,6 +38,44 @@
           </div>
         </div>
 
+        <div id="shadow-panel" class="shadow-panel hidden" aria-live="polite">
+          <div class="shadow-head">
+            <div>
+              <h2>跟读 · 会议节奏</h2>
+              <p class="shadow-sub">听一句 → 马上跟说。比的是用词和节奏，不是发音打分。</p>
+            </div>
+            <button id="btn-shadow-exit" class="btn btn-ghost" type="button">退出跟读</button>
+          </div>
+          <div class="shadow-progress">
+            <span id="shadow-step-label">1 / 8</span>
+            <div class="shadow-progress-bar"><div id="shadow-progress-fill"></div></div>
+          </div>
+          <div class="shadow-card">
+            <p id="shadow-zh" class="shadow-zh"></p>
+            <p id="shadow-en" class="shadow-en"></p>
+            <p id="shadow-feedback" class="shadow-feedback"></p>
+          </div>
+          <div class="shadow-controls">
+            <label class="shadow-rate">
+              <span>语速</span>
+              <select id="shadow-rate">
+                <option value="0.85">0.85x</option>
+                <option value="1" selected>1.0x</option>
+              </select>
+            </label>
+            <button id="btn-shadow-play" class="btn btn-ghost" type="button">▶ 听示范</button>
+            <button id="btn-shadow-mic" class="btn btn-primary" type="button">🎤 跟读</button>
+            <button id="btn-shadow-next" class="btn btn-ghost" type="button">下一句</button>
+            <button id="btn-shadow-retry" class="btn btn-ghost" type="button">再来一遍</button>
+          </div>
+        </div>
+
+        <div id="challenge-bar" class="challenge-bar hidden" aria-live="polite">
+          <span id="challenge-label">3 秒开口</span>
+          <strong id="challenge-countdown">3.0</strong>
+          <span id="challenge-hint">先开口，哪怕只说 Yes / I think...</span>
+        </div>
+
         <div class="input-bar">
           <button id="btn-mic" class="icon-btn" title="语音输入（说英文）">🎤</button>
           <textarea id="input" rows="1" placeholder="用英文说 / 输入你的回应，Enter 发送，Shift+Enter 换行"></textarea>
@@ -49,12 +87,21 @@
       <!-- 侧栏 -->
       <aside class="sidebar">
         <div class="tabs">
-          <button class="tab active" data-tab="phrasebook">表达收藏</button>
+          <button class="tab active" data-tab="templates">句型</button>
+          <button class="tab" data-tab="phrasebook">表达收藏</button>
           <button class="tab" data-tab="history">历史</button>
           <button id="btn-close-drawer" class="icon-btn drawer-close" type="button" title="关闭">✕</button>
         </div>
 
-        <div id="tab-phrasebook" class="tab-panel">
+        <div id="tab-templates" class="tab-panel">
+          <p class="tab-hint">万能句型可填入输入框或跟读；下方是当前行业行话。</p>
+          <h3 class="side-section-title">会议句型</h3>
+          <div id="template-list" class="card-list"></div>
+          <h3 class="side-section-title">行业行话</h3>
+          <div id="jargon-list" class="card-list"></div>
+        </div>
+
+        <div id="tab-phrasebook" class="tab-panel hidden">
           <div class="tab-head-row">
             <p class="tab-hint">点纠错卡片上的 ☆ 收藏地道表达，会后复习。</p>
             <button id="btn-speak-all" class="btn btn-ghost btn-speak-all" type="button">朗读全部</button>
@@ -71,6 +118,7 @@
 
     <div id="drawer-backdrop" class="drawer-backdrop hidden"></div>
     <nav class="mobile-dock" id="mobile-dock" aria-label="移动端收藏与历史">
+      <button type="button" class="dock-btn" data-open-tab="templates">🗂 句型</button>
       <button type="button" class="dock-btn" data-open-tab="phrasebook">⭐ 收藏</button>
       <button type="button" class="dock-btn" data-open-tab="history">🕘 历史</button>
     </nav>
@@ -109,6 +157,10 @@
           <span>温度（0 更稳 / 1 更活）</span>
           <input id="cfg-temp" type="number" min="0" max="2" step="0.1" value="0.7" />
         </label>
+        <label class="field">
+          <span>行业行话包（注入对练用词）</span>
+          <select id="cfg-industry"></select>
+        </label>
         <label class="field field-check">
           <input id="cfg-json" type="checkbox" checked />
           <span>强制 JSON 输出（OpenAI/DeepSeek 支持，出错可关闭）</span>
@@ -121,6 +173,14 @@
           <input id="cfg-handsfree" type="checkbox" />
           <span>免提模式（对方朗读完自动听你说，默认关）</span>
         </label>
+        <label class="field field-check">
+          <input id="cfg-strict" type="checkbox" />
+          <span>严格纠错（红线标错，语法/用词逐条挑，默认关）</span>
+        </label>
+        <label class="field field-check">
+          <input id="cfg-threesecond" type="checkbox" />
+          <span>3 秒开口挑战（对方说完倒计时，逼自己先开口，默认关）</span>
+        </label>
 
         <p class="modal-note">Key 只存在你本机浏览器 localStorage，不会上传到别处。</p>
 
@@ -132,6 +192,7 @@
     </div>
   </div>
 
+  <script src="content.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

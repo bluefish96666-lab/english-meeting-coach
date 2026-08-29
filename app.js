@@ -271,21 +271,54 @@ const PERSONAS = [
 ];
 
 /* ------------------------- 通用输出格式（拼接） ----------------------- */
+function getIndustryPack() {
+  const packs = typeof INDUSTRY_PACKS !== 'undefined' ? INDUSTRY_PACKS : {};
+  return packs[config.industry] || packs.none || { id: 'none', label: '通用', jargon: [] };
+}
+
 function buildSystemPrompt(persona, scenarioName, scenarioDesc) {
+  const pack = getIndustryPack();
+  const jargonLines = (pack.jargon || []).slice(0, 6).map((j) => '- ' + j.en);
+  const industryBlock = jargonLines.length
+    ? [
+        '',
+        'Industry flavor (' + pack.label + '): you MAY naturally use some of these phrases when they fit, but do NOT force jargon into every reply:',
+        ...jargonLines,
+      ]
+    : [];
+
+  const strict = !!config.strict;
+  const outputLine = strict
+    ? '{"reply":"your short in-character English reply (1-3 sentences, spoken style)","correction":"① 你说的是：<the user\'s exact last English sentence>\\n② 更地道的是：<corrected natural spoken English>\\n③ 为什么：<one short line explaining the fix>","errors":["短中文标签1","短中文标签2"],"focus":"one short Chinese line on the single most important improvement this round among: ' + persona.focusDims + '"}'
+    : '{"reply":"your short in-character English reply (1-3 sentences, spoken style)","correction":"① 你说的是：<the user\'s exact last English sentence>\\n② 更地道的是：<corrected natural spoken English>\\n③ 为什么：<one short line explaining the fix and a more natural phrasing>","focus":"one short Chinese line on the single most important improvement this round among: ' + persona.focusDims + '"}';
+
+  const correctionRules = strict
+    ? [
+        'STRICT correction mode is ON:',
+        '- Mark EVERY grammar / word-choice / tense / article / preposition problem you can find in the user\'s last message.',
+        '- Put short Chinese error labels in "errors" (e.g. "主谓一致","介词","时态","冠词","用词不地道"). 1-5 items. If truly clean, use ["基本正确"] and still polish ②.',
+        '- In ① quote the user\'s exact words; in ② give a fully natural spoken rewrite; in ③ explain the main fix in one Chinese line.',
+        '- Keep "reply" strictly in character — never teach inside "reply".',
+      ]
+    : [
+        'For "correction": quote the user\'s actual last English message as <原文>. If it was already fine, still pick the weakest part. Keep ② in natural spoken English and ③ to one line.',
+        'Keep "reply" strictly in character — do not put teaching or correction inside "reply".',
+      ];
+
   return [
     persona.promptBody,
     '',
     'Current scenario: ' + scenarioName + ' (' + scenarioDesc + ').',
+    ...industryBlock,
     '',
     'Rules:',
     '1. ALWAYS stay in character and speak English in the "reply" field. Use clear American English at a normal speaking pace. The user is B1 level.',
     '2. You only play the other party in this conversation. Do NOT teach and do NOT give answers during the roleplay.',
     '',
     'Output format — respond with ONLY a JSON object, no markdown fences, no extra text:',
-    '{"reply":"your short in-character English reply (1-3 sentences, spoken style)","correction":"① 你说的是：<the user\'s exact last English sentence>\\n② 更地道的是：<corrected natural spoken English>\\n③ 为什么：<one short line explaining the fix and a more natural phrasing>","focus":"one short Chinese line on the single most important improvement this round among: ' + persona.focusDims + '"}',
+    outputLine,
     '',
-    'For "correction": quote the user\'s actual last English message as <原文>. If it was already fine, still pick the weakest part. Keep ② in natural spoken English and ③ to one line.',
-    'Keep "reply" strictly in character — do not put teaching or correction inside "reply".',
+    ...correctionRules,
   ].join('\n');
 }
 
@@ -329,6 +362,9 @@ const DEFAULT_CONFIG = {
   json: true,
   stream: true,
   handsfree: false,
+  strict: false,
+  threeSecond: false,
+  industry: 'none',
 };
 
 const MAX_TOKENS = 800;
@@ -345,6 +381,13 @@ let history = sanitizeHistoryList(store.get('dave_history', []));
 let turnBusy = false;
 let requestGen = 0;
 
+const shadowState = {
+  active: false,
+  index: 0,
+  lines: [],
+  listening: false,
+};
+
 function sanitizeHistoryItem(h) {
   if (!h || typeof h !== 'object') return null;
   const id = Number(h.id);
@@ -358,6 +401,7 @@ function sanitizeHistoryItem(h) {
         text: String(m.text == null ? '' : m.text),
         correction: m.correction ? String(m.correction) : '',
         focus: m.focus ? String(m.focus) : '',
+        errors: Array.isArray(m.errors) ? m.errors.map((e) => String(e)).filter(Boolean).slice(0, 6) : [],
       }))
     : [];
   return {
@@ -441,7 +485,13 @@ function renderScenarioOptions() {
 }
 
 function renderWelcome() {
-  welcomeEl.innerHTML = '<p class="welcome-title">Pick a lane. Say a number.</p><ul class="welcome-list"></ul>';
+  welcomeEl.innerHTML =
+    '<p class="welcome-title">Pick a lane. Say a number.</p>' +
+    '<div class="welcome-actions">' +
+    '<button type="button" class="btn btn-primary" id="btn-start-shadow">跟读 · 会议节奏</button>' +
+    '</div>' +
+    '<p class="welcome-note">对练前可先打开侧栏「句型」热身；设置里可开 3 秒开口 / 严格纠错。</p>' +
+    '<ul class="welcome-list"></ul>';
   const list = welcomeEl.querySelector('.welcome-list');
   currentPersona.scenarios.forEach((s, i) => {
     const li = document.createElement('li');
@@ -449,6 +499,8 @@ function renderWelcome() {
     li.addEventListener('click', () => startSession(s.id));
     list.appendChild(li);
   });
+  const shadowBtn = welcomeEl.querySelector('#btn-start-shadow');
+  if (shadowBtn) shadowBtn.addEventListener('click', startShadowing);
 }
 
 /* ---------------------------- 会话管理 ------------------------------ */
@@ -463,6 +515,8 @@ function startSession(scenarioId, opts = {}) {
     requestGen += 1;
     turnBusy = false;
   }
+  exitShadowing({ silent: true });
+  clearChallenge();
   pauseHandsfree();
   const s = currentPersona.scenarios.find((x) => x.id === scenarioId) || currentPersona.scenarios[0];
   session = {
@@ -482,6 +536,8 @@ function startSession(scenarioId, opts = {}) {
 function resetToWelcome() {
   requestGen += 1;
   turnBusy = false;
+  exitShadowing({ silent: true });
+  clearChallenge();
   pauseHandsfree();
   session = null;
   resetChatView(true);
@@ -491,15 +547,15 @@ function resetToWelcome() {
   if (scn) scenarioSelect.value = scn.id;
 }
 
-function addMessage(role, text, correction, focus) {
+function addMessage(role, text, correction, focus, errors) {
   if (session) {
-    session.messages.push({ role, text, correction, focus });
+    session.messages.push({ role, text, correction, focus, errors });
   }
-  renderMessage(role, text, correction, focus);
+  renderMessage(role, text, correction, focus, errors);
   scrollToBottom();
 }
 
-function renderMessage(role, text, correction, focus) {
+function renderMessage(role, text, correction, focus, errors) {
   const wrap = document.createElement('div');
   wrap.className = `msg ${role}`;
 
@@ -522,18 +578,26 @@ function renderMessage(role, text, correction, focus) {
   wrap.appendChild(bubble);
 
   if (correction) {
-    wrap.appendChild(buildCorrectionCard(correction, focus));
+    wrap.appendChild(buildCorrectionCard(correction, focus, errors));
   }
   chatEl.appendChild(wrap);
 }
 
-function buildCorrectionCard(correction, focus) {
+function normalizeErrors(errors) {
+  if (!Array.isArray(errors)) return [];
+  return errors
+    .map((e) => String(e || '').trim())
+    .filter(Boolean)
+    .slice(0, 6);
+}
+
+function buildCorrectionCard(correction, focus, errors) {
   const card = document.createElement('div');
-  card.className = 'correction';
+  card.className = 'correction' + (config.strict ? ' strict' : '');
 
   const head = document.createElement('div');
   head.className = 'corr-head';
-  head.innerHTML = '<span>📝 纠错</span>';
+  head.innerHTML = config.strict ? '<span>📝 严格纠错</span>' : '<span>📝 纠错</span>';
   const star = document.createElement('button');
   star.className = 'star-btn';
   star.textContent = '☆';
@@ -568,6 +632,19 @@ function buildCorrectionCard(correction, focus) {
     else { div.className = 'line'; div.textContent = line; }
     card.appendChild(div);
   });
+
+  const errs = normalizeErrors(errors);
+  if (errs.length) {
+    const chips = document.createElement('div');
+    chips.className = 'error-chips';
+    errs.forEach((label) => {
+      const chip = document.createElement('span');
+      chip.className = 'error-chip';
+      chip.textContent = label;
+      chips.appendChild(chip);
+    });
+    card.appendChild(chips);
+  }
 
   if (focus) {
     const f = document.createElement('div');
@@ -843,12 +920,13 @@ function pickReplyFromRaw(raw) {
       reply: parsed.reply,
       correction: parsed.correction ? String(parsed.correction) : '',
       focus: parsed.focus ? String(parsed.focus) : '',
+      errors: normalizeErrors(parsed.errors),
     };
   }
   const text = String(raw || '').trim();
   if (!text) return null;
   if (text.charAt(0) === '{' && !parsed) return null;
-  return { reply: text, correction: '', focus: '' };
+  return { reply: text, correction: '', focus: '', errors: [] };
 }
 
 function buildApiMessages() {
@@ -883,7 +961,7 @@ function updateStreamingDave(ui, text) {
   scrollToBottom();
 }
 
-function finalizeStreamingDave(ui, reply, correction, focus) {
+function finalizeStreamingDave(ui, reply, correction, focus, errors) {
   ui.wrap.classList.remove('streaming');
   ui.textNode.textContent = reply || '';
   if (!ui.bubble.querySelector('.speak-btn')) {
@@ -895,10 +973,10 @@ function finalizeStreamingDave(ui, reply, correction, focus) {
     ui.bubble.appendChild(spk);
   }
   if (correction) {
-    ui.wrap.appendChild(buildCorrectionCard(correction, focus));
+    ui.wrap.appendChild(buildCorrectionCard(correction, focus, errors));
   }
   if (session) {
-    session.messages.push({ role: 'dave', text: reply, correction, focus });
+    session.messages.push({ role: 'dave', text: reply, correction, focus, errors });
   }
   scrollToBottom();
 }
@@ -906,7 +984,10 @@ function finalizeStreamingDave(ui, reply, correction, focus) {
 async function handleUserTurn() {
   const text = inputEl.value.trim();
   if (!text || turnBusy) return;
+  if (shadowState.active) return;
   turnBusy = true;
+  markChallengeOpened();
+  clearChallenge();
   cancelHandsfreeListen();
   if (!session) {
     startSession(scenarioSelect.value || currentPersona.scenarios[0].id, { deferListen: true, continueTurn: true });
@@ -942,12 +1023,12 @@ async function handleUserTurn() {
     if (typing.parentNode) typing.remove();
     const picked = pickReplyFromRaw(raw);
     if (!picked) throw new Error('回复不完整或无法解析，请重试');
-    const { reply, correction, focus } = picked;
+    const { reply, correction, focus, errors } = picked;
 
     if (streamUi) {
-      finalizeStreamingDave(streamUi, reply, correction, focus);
+      finalizeStreamingDave(streamUi, reply, correction, focus, errors);
     } else {
-      addMessage('dave', reply, correction, focus);
+      addMessage('dave', reply, correction, focus, errors);
     }
     turnBusy = false;
     await speakThenMaybeListen(reply);
@@ -988,6 +1069,7 @@ async function endReview() {
     return;
   }
   turnBusy = true;
+  clearChallenge();
   const gen = requestGen;
   pauseHandsfree();
   const typing = showTyping();
@@ -1053,12 +1135,13 @@ let ttsWatchdog = null;
 let ttsActive = false;
 let currentSpeakPromise = null;
 
-function makeUtterance(text) {
+function makeUtterance(text, opts) {
   const u = new SpeechSynthesisUtterance(text);
   u.lang = 'en-US';
   const v = cachedVoice || pickVoice();
   if (v) u.voice = v;
-  u.rate = 1.0;
+  const rate = opts && opts.rate != null ? Number(opts.rate) : 1.0;
+  u.rate = Number.isFinite(rate) && rate > 0 ? rate : 1.0;
   return u;
 }
 
@@ -1158,7 +1241,7 @@ function isTtsPlaying() {
   }
 }
 
-function speak(text) {
+function speak(text, opts) {
   const p = new Promise((resolve) => {
     let settled = false;
     let safety = null;
@@ -1187,7 +1270,7 @@ function speak(text) {
       setTimeout(() => {
         if (gen !== ttsGen) { finish(); return; }
         try {
-          const u = makeUtterance(text);
+          const u = makeUtterance(text, opts);
           u.onend = finish;
           u.onerror = finish;
           speechSynthesis.speak(u);
@@ -1255,7 +1338,81 @@ async function speakThenMaybeListen(text) {
   const id = ++speakListenId;
   await speak(text);
   if (id !== speakListenId) return;
+  if (shadowState.active) return;
+  startChallengeCountdown();
   if (config.handsfree && !turnBusy && !isRecording) scheduleHandsfreeListen();
+}
+
+/* ---------------------------- 3 秒开口挑战 --------------------------- */
+let challengeTimer = null;
+let challengeRaf = null;
+let challengeGen = 0;
+let challengeOpened = false;
+
+function clearChallenge() {
+  challengeGen += 1;
+  if (challengeTimer) {
+    clearTimeout(challengeTimer);
+    challengeTimer = null;
+  }
+  if (challengeRaf) {
+    cancelAnimationFrame(challengeRaf);
+    challengeRaf = null;
+  }
+  const bar = $('challenge-bar');
+  if (bar) {
+    bar.classList.add('hidden');
+    bar.classList.remove('passed', 'missed');
+  }
+  challengeOpened = false;
+}
+
+function markChallengeOpened() {
+  if (!config.threeSecond) return;
+  if (!challengeOpened && $('challenge-bar') && !$('challenge-bar').classList.contains('hidden')) {
+    challengeOpened = true;
+    const bar = $('challenge-bar');
+    bar.classList.remove('missed');
+    bar.classList.add('passed');
+    $('challenge-label').textContent = '开口成功';
+    $('challenge-countdown').textContent = '✓';
+    $('challenge-hint').textContent = '先说出来，再补完整句';
+  }
+}
+
+function startChallengeCountdown() {
+  if (!config.threeSecond || turnBusy || shadowState.active) return;
+  clearChallenge();
+  const bar = $('challenge-bar');
+  if (!bar) return;
+  const gen = challengeGen;
+  const started = performance.now();
+  const duration = 3000;
+  challengeOpened = false;
+  bar.classList.remove('hidden', 'passed', 'missed');
+  $('challenge-label').textContent = '3 秒开口';
+  $('challenge-countdown').textContent = '3.0';
+  $('challenge-hint').textContent = '先开口，哪怕只说 Yes / I think...';
+
+  const tick = (now) => {
+    if (gen !== challengeGen) return;
+    if (challengeOpened) return;
+    const left = Math.max(0, duration - (now - started));
+    $('challenge-countdown').textContent = (left / 1000).toFixed(1);
+    if (left <= 0) {
+      bar.classList.add('missed');
+      $('challenge-label').textContent = '超时';
+      $('challenge-countdown').textContent = '0.0';
+      $('challenge-hint').textContent = '下次先蹦一个词，再补完整句';
+      addMessage('system', '⏱ 3 秒开口超时。下次先说 Yes / No / I think...，再说完整句。', null, null);
+      challengeTimer = setTimeout(() => {
+        if (gen === challengeGen) clearChallenge();
+      }, 2200);
+      return;
+    }
+    challengeRaf = requestAnimationFrame(tick);
+  };
+  challengeRaf = requestAnimationFrame(tick);
 }
 
 function updateMicStatus() {
@@ -1298,7 +1455,15 @@ function setupRecognition() {
     const err = lastRecError;
     lastRecError = '';
     const spoken = inputEl.value.trim();
-    if (err === 'aborted' || err === 'not-allowed') return;
+    if (err === 'aborted' || err === 'not-allowed') {
+      shadowState.listening = false;
+      return;
+    }
+    if (shadowState.active && micSource === 'shadow') {
+      shadowState.listening = false;
+      handleShadowTranscript(spoken, err);
+      return;
+    }
     if (spoken) {
       noSpeechRetries = 0;
       if (!turnBusy) handleUserTurn();
@@ -1331,7 +1496,11 @@ function setupRecognition() {
 }
 
 function startMic(source) {
-  if (turnBusy) {
+  if (shadowState.active && source !== 'shadow') {
+    addMessage('system', '正在跟读模式，请用跟读面板里的麦克风。', null, null);
+    return;
+  }
+  if (turnBusy && source !== 'shadow') {
     if (source !== 'handsfree') {
       addMessage('system', '对方还在回复，请稍后再说。', null, null);
     }
@@ -1341,6 +1510,7 @@ function startMic(source) {
     addMessage('system', '当前浏览器不支持语音识别（Web Speech API），请用 Chrome / Edge，并走 localhost 或 HTTPS。', null, null);
     return;
   }
+  if (source !== 'shadow') markChallengeOpened();
   speakListenId += 1;
   cancelHandsfreeListen();
   stopTTS();
@@ -1378,6 +1548,7 @@ function compactMessages(messages) {
     text: String(m.text || '').slice(0, HISTORY_TEXT_CAP),
     correction: m.correction ? String(m.correction).slice(0, HISTORY_CORR_CAP) : (m.correction || ''),
     focus: m.focus ? String(m.focus).slice(0, 200) : (m.focus || ''),
+    errors: Array.isArray(m.errors) ? m.errors.map((e) => String(e)).filter(Boolean).slice(0, 6) : [],
   }));
 }
 
@@ -1465,8 +1636,9 @@ function restoreSession(h) {
       text: m.text,
       correction: m.correction,
       focus: m.focus,
+      errors: m.errors,
     });
-    renderMessage(m.role, m.text, m.correction, m.focus);
+    renderMessage(m.role, m.text, m.correction, m.focus, m.errors);
   });
   scrollToBottom();
   inputEl.focus();
@@ -1538,7 +1710,21 @@ function renderHistory() {
 }
 
 /* ---------------------------- 设置弹窗 ------------------------------ */
+function fillIndustryOptions() {
+  const sel = $('cfg-industry');
+  if (!sel) return;
+  const packs = typeof INDUSTRY_PACKS !== 'undefined' ? INDUSTRY_PACKS : {};
+  sel.innerHTML = '';
+  Object.keys(packs).forEach((id) => {
+    const opt = document.createElement('option');
+    opt.value = id;
+    opt.textContent = packs[id].label;
+    sel.appendChild(opt);
+  });
+}
+
 function openSettings() {
+  fillIndustryOptions();
   $('cfg-base').value = config.base;
   $('cfg-key').value = config.key;
   $('cfg-model').value = config.model;
@@ -1546,6 +1732,9 @@ function openSettings() {
   $('cfg-json').checked = config.json;
   if ($('cfg-stream')) $('cfg-stream').checked = config.stream !== false;
   if ($('cfg-handsfree')) $('cfg-handsfree').checked = !!config.handsfree;
+  if ($('cfg-strict')) $('cfg-strict').checked = !!config.strict;
+  if ($('cfg-threesecond')) $('cfg-threesecond').checked = !!config.threeSecond;
+  if ($('cfg-industry')) $('cfg-industry').value = config.industry || 'none';
   $('settings-overlay').classList.remove('hidden');
 }
 function closeSettings() { $('settings-overlay').classList.add('hidden'); }
@@ -1559,10 +1748,15 @@ function saveSettings() {
   config.json = $('cfg-json').checked;
   config.stream = $('cfg-stream') ? $('cfg-stream').checked : true;
   config.handsfree = $('cfg-handsfree') ? $('cfg-handsfree').checked : false;
+  config.strict = $('cfg-strict') ? $('cfg-strict').checked : false;
+  config.threeSecond = $('cfg-threesecond') ? $('cfg-threesecond').checked : false;
+  config.industry = $('cfg-industry') ? ($('cfg-industry').value || 'none') : 'none';
   persistOrWarn('dave_config', config);
   closeSettings();
   updateMicStatus();
+  renderTemplates();
   addMessage('system', '✅ 设置已保存（Key 仅存本机浏览器）。', null, null);
+  if (!config.threeSecond) clearChallenge();
   if (!config.handsfree) {
     pauseHandsfree();
   } else if (!prevHandsfree && session && !turnBusy) {
@@ -1580,7 +1774,224 @@ function readSettingsForm() {
     json: $('cfg-json').checked,
     stream: $('cfg-stream') ? $('cfg-stream').checked : config.stream,
     handsfree: $('cfg-handsfree') ? $('cfg-handsfree').checked : config.handsfree,
+    strict: $('cfg-strict') ? $('cfg-strict').checked : config.strict,
+    threeSecond: $('cfg-threesecond') ? $('cfg-threesecond').checked : config.threeSecond,
+    industry: $('cfg-industry') ? ($('cfg-industry').value || 'none') : config.industry,
   };
+}
+
+/* ---------------------------- 句型 & 行话 ---------------------------- */
+function insertIntoInput(text) {
+  if (shadowState.active) {
+    addMessage('system', '跟读模式中：请用跟读面板练习，或先退出跟读。', null, null);
+    return;
+  }
+  const cur = inputEl.value.trim();
+  inputEl.value = cur ? (cur + ' ' + text) : text;
+  autoResize();
+  markChallengeOpened();
+  inputEl.focus();
+  closeMobileDrawer();
+}
+
+function renderTemplateCard(item, listEl) {
+  const card = document.createElement('div');
+  card.className = 'template-card';
+  if (item.label) {
+    const label = document.createElement('div');
+    label.className = 'tpl-label';
+    label.textContent = item.label;
+    card.appendChild(label);
+  }
+  const en = document.createElement('div');
+  en.className = 'en';
+  en.textContent = item.en;
+  card.appendChild(en);
+  if (item.zh) {
+    const zh = document.createElement('div');
+    zh.className = 'zh';
+    zh.textContent = item.zh;
+    card.appendChild(zh);
+  }
+  const actions = document.createElement('div');
+  actions.className = 'tpl-actions';
+  const fill = document.createElement('button');
+  fill.type = 'button';
+  fill.textContent = '填入';
+  fill.addEventListener('click', () => insertIntoInput(item.en));
+  const shadowOne = document.createElement('button');
+  shadowOne.type = 'button';
+  shadowOne.textContent = '跟读';
+  shadowOne.addEventListener('click', () => speak(item.en, { rate: 0.95 }));
+  actions.appendChild(fill);
+  actions.appendChild(shadowOne);
+  card.appendChild(actions);
+  listEl.appendChild(card);
+}
+
+function renderTemplates() {
+  const tplEl = $('template-list');
+  const jarEl = $('jargon-list');
+  if (!tplEl || !jarEl) return;
+  tplEl.innerHTML = '';
+  jarEl.innerHTML = '';
+  const templates = typeof MEETING_TEMPLATES !== 'undefined' ? MEETING_TEMPLATES : [];
+  templates.forEach((t) => renderTemplateCard(t, tplEl));
+  if (!templates.length) {
+    tplEl.innerHTML = '<div class="empty">句型库未加载。</div>';
+  }
+  const pack = getIndustryPack();
+  if (!pack.jargon || !pack.jargon.length) {
+    jarEl.innerHTML = '<div class="empty">当前为通用模式。到设置里选 IT / 产品 / 商务 可加载行话。</div>';
+    return;
+  }
+  pack.jargon.forEach((j) => renderTemplateCard({ en: j.en, zh: j.zh, label: pack.label }, jarEl));
+}
+
+/* ---------------------------- 跟读模式 ------------------------------ */
+function tokenizeEn(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9'\s]/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+function scoreShadow(target, spoken) {
+  const a = tokenizeEn(target);
+  const b = tokenizeEn(spoken);
+  if (!a.length) return { score: 0, missing: [], heard: [] };
+  if (!b.length) return { score: 0, missing: a.slice(0, 6), heard: [] };
+  const setB = new Set(b);
+  const missing = a.filter((w) => !setB.has(w));
+  const hit = a.length - missing.length;
+  const score = hit / a.length;
+  return {
+    score,
+    missing: missing.slice(0, 6),
+    heard: b.slice(0, 12),
+  };
+}
+
+function setShadowFeedback(text, kind) {
+  const el = $('shadow-feedback');
+  if (!el) return;
+  el.textContent = text || '';
+  el.classList.remove('ok', 'bad');
+  if (kind) el.classList.add(kind);
+}
+
+function renderShadowLine() {
+  const total = shadowState.lines.length || 1;
+  const idx = Math.min(shadowState.index, total - 1);
+  const line = shadowState.lines[idx] || { en: '', zh: '' };
+  $('shadow-step-label').textContent = (idx + 1) + ' / ' + total;
+  $('shadow-progress-fill').style.width = (((idx + 1) / total) * 100).toFixed(1) + '%';
+  $('shadow-zh').textContent = line.zh || '';
+  $('shadow-en').textContent = line.en || '';
+  setShadowFeedback('', null);
+}
+
+function startShadowing() {
+  clearChallenge();
+  pauseHandsfree();
+  session = null;
+  resetChatView(false);
+  welcomeEl.classList.add('hidden');
+  if (chatEl) chatEl.classList.add('hidden');
+  const panel = $('shadow-panel');
+  if (panel) panel.classList.remove('hidden');
+  shadowState.active = true;
+  shadowState.index = 0;
+  shadowState.listening = false;
+  shadowState.lines = (typeof SHADOWING_LINES !== 'undefined' ? SHADOWING_LINES : []).slice();
+  if (!shadowState.lines.length) {
+    setShadowFeedback('跟读句子未加载。', 'bad');
+    return;
+  }
+  renderShadowLine();
+  inputEl.value = '';
+  autoResize();
+}
+
+function exitShadowing(opts) {
+  const wasActive = shadowState.active;
+  shadowState.active = false;
+  shadowState.listening = false;
+  shadowState.index = 0;
+  const panel = $('shadow-panel');
+  if (panel) panel.classList.add('hidden');
+  if (chatEl) chatEl.classList.remove('hidden');
+  if (wasActive && !(opts && opts.silent)) {
+    resetToWelcome();
+  }
+}
+
+async function playShadowLine() {
+  if (!shadowState.active) return;
+  const line = shadowState.lines[shadowState.index];
+  if (!line) return;
+  const rateEl = $('shadow-rate');
+  const rate = rateEl ? Number(rateEl.value) : 1;
+  setShadowFeedback('听示范…', null);
+  await speak(line.en, { rate: rate || 1 });
+  if (shadowState.active) setShadowFeedback('轮到你了，点「跟读」或直接开麦。', null);
+}
+
+function startShadowMic() {
+  if (!shadowState.active) return;
+  const line = shadowState.lines[shadowState.index];
+  if (!line) return;
+  inputEl.value = '';
+  autoResize();
+  shadowState.listening = true;
+  setShadowFeedback('正在听你跟读…', null);
+  startMic('shadow');
+}
+
+function handleShadowTranscript(spoken, err) {
+  if (!shadowState.active) return;
+  const line = shadowState.lines[shadowState.index];
+  if (!line) return;
+  if (!spoken) {
+    setShadowFeedback(err === 'no-speech' ? '没听清，再来一遍。' : '没听到内容，点「跟读」再试。', 'bad');
+    return;
+  }
+  const result = scoreShadow(line.en, spoken);
+  if (result.score >= 0.7) {
+    setShadowFeedback(
+      '跟上了（约 ' + Math.round(result.score * 100) + '% 词命中）。可以下一句。',
+      'ok'
+    );
+  } else {
+    const miss = result.missing.length ? '漏了：' + result.missing.join(', ') : '节奏偏了';
+    setShadowFeedback(
+      '再跟一遍。命中约 ' + Math.round(result.score * 100) + '%。' + miss,
+      'bad'
+    );
+  }
+  inputEl.value = '';
+  autoResize();
+}
+
+function nextShadowLine() {
+  if (!shadowState.active) return;
+  if (shadowState.index >= shadowState.lines.length - 1) {
+    setShadowFeedback('本组跟读完成。可以退出，或点「再来一遍」从第一句重练。', 'ok');
+    return;
+  }
+  shadowState.index += 1;
+  renderShadowLine();
+}
+
+function retryShadowLine() {
+  if (!shadowState.active) return;
+  if (shadowState.index >= shadowState.lines.length - 1 &&
+      $('shadow-feedback') && /完成/.test($('shadow-feedback').textContent || '')) {
+    shadowState.index = 0;
+  }
+  renderShadowLine();
+  playShadowLine();
 }
 
 async function testConnection() {
@@ -1625,10 +2036,16 @@ function bindEvents() {
       handleUserTurn();
     }
   });
-  inputEl.addEventListener('input', autoResize);
+  inputEl.addEventListener('input', () => {
+    autoResize();
+    if (inputEl.value.trim()) markChallengeOpened();
+  });
 
   $('btn-mic').addEventListener('click', toggleMic);
-  $('btn-new').addEventListener('click', () => { startSession(scenarioSelect.value || currentPersona.scenarios[0].id); });
+  $('btn-new').addEventListener('click', () => {
+    exitShadowing({ silent: true });
+    startSession(scenarioSelect.value || currentPersona.scenarios[0].id);
+  });
   $('btn-review').addEventListener('click', endReview);
 
   $('btn-settings').addEventListener('click', openSettings);
@@ -1666,12 +2083,26 @@ function bindEvents() {
   window.addEventListener('resize', () => {
     if (window.innerWidth > 860) closeMobileDrawer();
   });
+
+  const exitShadow = $('btn-shadow-exit');
+  if (exitShadow) exitShadow.addEventListener('click', () => exitShadowing());
+  const playShadow = $('btn-shadow-play');
+  if (playShadow) playShadow.addEventListener('click', playShadowLine);
+  const micShadow = $('btn-shadow-mic');
+  if (micShadow) micShadow.addEventListener('click', startShadowMic);
+  const nextShadow = $('btn-shadow-next');
+  if (nextShadow) nextShadow.addEventListener('click', nextShadowLine);
+  const retryShadow = $('btn-shadow-retry');
+  if (retryShadow) retryShadow.addEventListener('click', retryShadowLine);
 }
 
 function switchSidebarTab(name) {
   document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === name));
-  $('tab-phrasebook').classList.toggle('hidden', name !== 'phrasebook');
-  $('tab-history').classList.toggle('hidden', name !== 'history');
+  const panels = ['templates', 'phrasebook', 'history'];
+  panels.forEach((n) => {
+    const el = $('tab-' + n);
+    if (el) el.classList.toggle('hidden', n !== name);
+  });
   document.querySelectorAll('.dock-btn').forEach((b) => {
     b.classList.toggle('active', b.dataset.openTab === name);
   });
@@ -1709,6 +2140,7 @@ function init() {
   renderPersonaOptions();
   renderScenarioOptions();
   renderWelcome();
+  renderTemplates();
   renderPhrasebook();
   renderHistory();
   bindEvents();
