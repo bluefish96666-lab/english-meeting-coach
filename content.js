@@ -1,5 +1,6 @@
 /* =========================================================================
- * 会议句型 / 行业行话 / 跟读文本（静态内容）
+ * 会议语块 / 行业行话 / 跟读文本（静态内容）
+ * 语块（chunk）= 可以整块调取的固定表达。每张卡：模板 + 中文 + 例句 + 变形句。
  * ========================================================================= */
 
 'use strict';
@@ -10,60 +11,90 @@ const MEETING_TEMPLATES = [
     label: '求助',
     en: "I'm trying to... but could you help me with...?",
     zh: '说明自己在做什么，并请求对方帮一把',
+    example: "I'm trying to fix the login bug, but could you help me with the token flow?",
+    variant: "I'm stuck on the token flow — could you take a quick look?",
+    cue: '你在修登录 bug，想请对方帮你看 token 流程',
   },
   {
     id: 'opinion',
     label: '观点',
     en: 'Actually, I think... because...',
     zh: '先表态，再给一个简短理由',
+    example: 'Actually, I think we should cut scope, because the timeline is already tight.',
+    variant: "Honestly, I'd cut scope first — the timeline is too tight.",
+    cue: '表态：应该先砍范围，因为时间已经很紧',
   },
   {
     id: 'suggest',
     label: '建议',
     en: 'What if we...? That way we can...',
     zh: '提出方案，并点出好处',
+    example: 'What if we ship an MVP on Friday? That way we can get feedback sooner.',
+    variant: 'How about an MVP on Friday, so we get feedback sooner?',
+    cue: '建议周五先上 MVP，这样能更早拿到反馈',
   },
   {
     id: 'experience',
     label: '经验',
     en: 'From my experience,...',
     zh: '用过往经验支撑判断',
+    example: 'From my experience, rushing the launch creates more support load later.',
+    variant: "In my experience, a rushed launch just means more support tickets.",
+    cue: '用经验说：赶着上线后面会有更多支持负担',
   },
   {
     id: 'rebuttal',
     label: '礼貌反驳',
     en: "Correct me if I'm wrong, but...",
     zh: '温和地提出不同看法',
+    example: "Correct me if I'm wrong, but the client asked for reliability, not more features.",
+    variant: "I might be missing something, but wasn't reliability the ask?",
+    cue: '礼貌反驳：客户要的是可靠性，不是更多功能',
   },
   {
     id: 'align',
     label: '对齐',
     en: "Just to make sure we're aligned — are we saying...?",
     zh: '确认双方理解一致',
+    example: "Just to make sure we're aligned — are we saying Monday is the hard date?",
+    variant: 'So to confirm: Monday is the hard deadline, right?',
+    cue: '确认对齐：周一是硬截止日期吗',
   },
   {
     id: 'delay',
     label: '延期',
     en: "We're going to need more time. The blocker is..., so the new date would be...",
     zh: '说明卡点，并给出新日期',
+    example: "We're going to need more time. The blocker is the vendor API, so the new date would be Thursday.",
+    variant: "We'll need until Thursday — the vendor API is blocking us.",
+    cue: '说明需要延期：卡在供应商 API，新日期周四',
   },
   {
     id: 'clarify',
     label: '澄清',
     en: 'Can I clarify that for a second? What I meant was...',
     zh: '打断后重新说清楚自己的意思',
+    example: 'Can I clarify that for a second? What I meant was we pause, not cancel.',
+    variant: 'Let me rephrase — I meant pause, not cancel.',
+    cue: '澄清：我的意思是暂停，不是取消',
   },
   {
     id: 'commit',
     label: '承诺',
     en: "I'll own that. You'll have an update by...",
     zh: '认领事项并给出时间点',
+    example: "I'll own that. You'll have an update by 4pm today.",
+    variant: "That's on me — I'll update you by 4pm.",
+    cue: '认领任务，承诺今天 4 点前给更新',
   },
   {
     id: 'pushback',
     label: '推回',
-    en: "I hear you, but if we do that, we risk.... Can we prioritize... instead?",
+    en: 'I hear you, but if we do that, we risk.... Can we prioritize... instead?',
     zh: '承认对方关切，再提出替代方案',
+    example: 'I hear you, but if we do that, we risk breaking checkout. Can we prioritize the fix instead?',
+    variant: 'Fair point, but that could break checkout — can the fix go first?',
+    cue: '推回：那样会有弄坏结账的风险，能否先做修复',
   },
 ];
 
@@ -136,7 +167,7 @@ const INDUSTRY_PACKS = {
         zh: '成功指标应是激活，而不只是功能做完',
       },
       {
-        en: "Can we timebox discovery to two days and then decide?",
+        en: 'Can we timebox discovery to two days and then decide?',
         zh: '发现阶段限两天，然后拍板',
       },
       {
@@ -158,7 +189,7 @@ const INDUSTRY_PACKS = {
         zh: '错过日期的商业影响是什么',
       },
       {
-        en: "We can meet the timeline if we descope X or add budget for Y.",
+        en: 'We can meet the timeline if we descope X or add budget for Y.',
         zh: '砍掉 X 或加 Y 的预算，才能赶上时间',
       },
       {
@@ -189,37 +220,38 @@ const INDUSTRY_PACKS = {
   },
 };
 
+/* 跟读句：每句 8–12 词、口语语气，一组约 1 分钟 */
 const SHADOWING_LINES = [
   {
-    en: "Alright, let's get started. What's the impact if we pull the deadline forward?",
-    zh: '会议开场：先问提前交付的影响',
+    en: "Let's get started. What's the impact of the new deadline?",
+    zh: '会议开场：先问新截止日期的影响',
   },
   {
-    en: "Actually, I think we should cut scope first, because the critical path is already tight.",
-    zh: '用「观点句型」表态并给理由',
+    en: 'Actually, I think we should cut scope first.',
+    zh: '用「观点语块」先表态',
   },
   {
-    en: "What if we ship an MVP this Friday? That way we can collect feedback sooner.",
-    zh: '用「建议句型」推进方案',
+    en: 'What if we ship an MVP this Friday?',
+    zh: '用「建议语块」推进方案',
   },
   {
-    en: "Correct me if I'm wrong, but the client asked for reliability, not more features.",
+    en: "Correct me if I'm wrong, but they asked for reliability.",
     zh: '用「礼貌反驳」拉回重点',
   },
   {
-    en: "Just to make sure we're aligned — are we saying Monday is the hard date?",
+    en: "Just to make sure we're aligned — Monday is the hard date?",
     zh: '对齐确认硬截止日期',
   },
   {
-    en: "I'll own the status update. You'll have a written summary by 4pm.",
+    en: "I'll own that. You'll have an update by four.",
     zh: '承诺事项与时间点',
   },
   {
-    en: "Let's circle back to the pain points and align the deliverables.",
-    zh: 'IT 行话：回到痛点并对齐交付',
+    en: "Let's circle back to the pain points after lunch.",
+    zh: 'IT 行话：稍后回到痛点',
   },
   {
-    en: "From my experience, rushing the launch usually creates more support load later.",
+    en: 'From my experience, rushing the launch costs more later.',
     zh: '用经验支撑判断',
   },
 ];

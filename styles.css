@@ -333,6 +333,78 @@ html, body {
   color: var(--muted);
 }
 
+/* 今日训练闭环 */
+.today-plan {
+  margin: 14px 0 4px;
+  padding: 12px 14px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  text-align: left;
+}
+.today-plan-head {
+  display: flex; justify-content: space-between; align-items: baseline;
+  font-size: 12.5px; color: var(--muted); margin-bottom: 8px;
+}
+.today-plan-head strong { color: var(--text); font-size: 13px; }
+.today-steps { display: flex; gap: 6px; flex-wrap: wrap; }
+.today-step {
+  flex: 1 1 120px;
+  display: flex; align-items: center; gap: 6px;
+  padding: 7px 9px;
+  border-radius: 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+}
+.today-step:hover { border-color: var(--accent); }
+.today-step.done {
+  color: #b8f0d8;
+  border-color: #2a5a48;
+  background: #123028;
+}
+.today-step .mark { font-weight: 700; width: 14px; text-align: center; }
+.today-step .sub { margin-left: auto; font-size: 11px; opacity: .75; }
+
+/* 语块反射 */
+.shadow-timer {
+  display: flex; align-items: center; gap: 8px;
+  margin: 4px 0 10px;
+  color: #f6d9a8; font-size: 12.5px;
+}
+.shadow-timer strong {
+  font-size: 22px; min-width: 2.4em; text-align: center;
+  color: #fff; font-variant-numeric: tabular-nums;
+}
+.shadow-timer.passed { color: #b8f0d8; }
+.shadow-timer.missed { color: #ffc0c6; }
+.shadow-en.masked {
+  filter: blur(7px);
+  user-select: none;
+  opacity: .55;
+  transition: filter .2s, opacity .2s;
+}
+.shadow-score { margin-left: 8px; color: var(--good); font-weight: 600; }
+.shadow-tip { margin: 0; font-size: 11.5px; color: var(--muted); }
+
+.template-card .example, .template-card .variant {
+  font-size: 12.5px; line-height: 1.45; margin: 2px 0 4px;
+  color: #d8e0f0;
+}
+.template-card .example b, .template-card .variant b {
+  color: var(--muted); font-weight: 600; margin-right: 4px; font-size: 11px;
+}
+.template-card .variant { color: #b9c5dd; }
+
+.deferred-summary {
+  margin-top: 12px; padding-top: 10px;
+  border-top: 1px dashed var(--accent-soft);
+}
+.deferred-summary h4 { margin: 0 0 8px; font-size: 13px; color: var(--warn); }
+.deferred-summary .correction { margin-top: 8px; }
+
 /* ===== 输入栏 ===== */
 .input-bar {
   display: flex; align-items: flex-end; gap: 8px;

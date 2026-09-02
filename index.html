@@ -41,22 +41,24 @@
         <div id="shadow-panel" class="shadow-panel hidden" aria-live="polite">
           <div class="shadow-head">
             <div>
-              <h2>跟读 · 会议节奏</h2>
-              <p class="shadow-sub">听一句 → 马上跟说。比的是用词和节奏，不是发音打分。</p>
+              <h2 id="shadow-title">跟读 · 会议节奏</h2>
+              <p id="shadow-sub" class="shadow-sub">听一句 → 马上跟说。比的是用词和节奏，不是发音打分。</p>
             </div>
-            <button id="btn-shadow-exit" class="btn btn-ghost" type="button">退出跟读</button>
+            <button id="btn-shadow-exit" class="btn btn-ghost" type="button">退出</button>
           </div>
           <div class="shadow-progress">
             <span id="shadow-step-label">1 / 8</span>
             <div class="shadow-progress-bar"><div id="shadow-progress-fill"></div></div>
+            <span id="shadow-score-label" class="shadow-score hidden">0 命中</span>
           </div>
           <div class="shadow-card">
             <p id="shadow-zh" class="shadow-zh"></p>
+            <div id="shadow-timer" class="shadow-timer hidden"><strong id="shadow-timer-num">3.0</strong><span>秒内说出这个语块</span></div>
             <p id="shadow-en" class="shadow-en"></p>
             <p id="shadow-feedback" class="shadow-feedback"></p>
           </div>
           <div class="shadow-controls">
-            <label class="shadow-rate">
+            <label class="shadow-rate" id="shadow-rate-wrap">
               <span>语速</span>
               <select id="shadow-rate">
                 <option value="0.85">0.85x</option>
@@ -65,9 +67,11 @@
             </label>
             <button id="btn-shadow-play" class="btn btn-ghost" type="button">▶ 听示范</button>
             <button id="btn-shadow-mic" class="btn btn-primary" type="button">🎤 跟读</button>
+            <button id="btn-shadow-reveal" class="btn btn-ghost hidden" type="button">看答案</button>
             <button id="btn-shadow-next" class="btn btn-ghost" type="button">下一句</button>
             <button id="btn-shadow-retry" class="btn btn-ghost" type="button">再来一遍</button>
           </div>
+          <p class="shadow-tip">也可以直接在下方输入框打出来，回车提交。</p>
         </div>
 
         <div id="challenge-bar" class="challenge-bar hidden" aria-live="polite">
@@ -87,15 +91,15 @@
       <!-- 侧栏 -->
       <aside class="sidebar">
         <div class="tabs">
-          <button class="tab active" data-tab="templates">句型</button>
+          <button class="tab active" data-tab="templates">语块</button>
           <button class="tab" data-tab="phrasebook">表达收藏</button>
           <button class="tab" data-tab="history">历史</button>
           <button id="btn-close-drawer" class="icon-btn drawer-close" type="button" title="关闭">✕</button>
         </div>
 
         <div id="tab-templates" class="tab-panel">
-          <p class="tab-hint">万能句型可填入输入框或跟读；下方是当前行业行话。</p>
-          <h3 class="side-section-title">会议句型</h3>
+          <p class="tab-hint">语块 = 整块调取的固定表达。每张卡有例句和变形句，可填入、跟读或收藏。</p>
+          <h3 class="side-section-title">会议语块</h3>
           <div id="template-list" class="card-list"></div>
           <h3 class="side-section-title">行业行话</h3>
           <div id="jargon-list" class="card-list"></div>
@@ -118,7 +122,7 @@
 
     <div id="drawer-backdrop" class="drawer-backdrop hidden"></div>
     <nav class="mobile-dock" id="mobile-dock" aria-label="移动端收藏与历史">
-      <button type="button" class="dock-btn" data-open-tab="templates">🗂 句型</button>
+      <button type="button" class="dock-btn" data-open-tab="templates">🗂 语块</button>
       <button type="button" class="dock-btn" data-open-tab="phrasebook">⭐ 收藏</button>
       <button type="button" class="dock-btn" data-open-tab="history">🕘 历史</button>
     </nav>
@@ -180,6 +184,10 @@
         <label class="field field-check">
           <input id="cfg-threesecond" type="checkbox" />
           <span>3 秒开口挑战（对方说完倒计时，逼自己先开口，默认关）</span>
+        </label>
+        <label class="field field-check">
+          <input id="cfg-defer" type="checkbox" />
+          <span>先流畅后纠错（对练中不弹纠错卡，结束复盘时一次性汇总，默认关）</span>
         </label>
 
         <p class="modal-note">Key 只存在你本机浏览器 localStorage，不会上传到别处。</p>

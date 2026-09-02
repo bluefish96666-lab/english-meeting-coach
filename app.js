@@ -364,6 +364,7 @@ const DEFAULT_CONFIG = {
   handsfree: false,
   strict: false,
   threeSecond: false,
+  deferCorrection: false,
   industry: 'none',
 };
 
@@ -386,10 +387,57 @@ let requestGen = 0;
 
 const shadowState = {
   active: false,
+  mode: 'shadow', // 'shadow' 跟读 | 'reflex' 语块反射
   index: 0,
   lines: [],
   listening: false,
+  answered: false,
+  hits: 0,
+  timerRaf: null,
+  timerGen: 0,
 };
+let restoring = false;
+
+/* ------------------------- 今日训练进度（本机） ---------------------- */
+const PROGRESS_KEY = 'dave_progress';
+function todayKey() {
+  const d = new Date();
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+function loadProgress() {
+  const raw = store.get(PROGRESS_KEY, null);
+  const today = todayKey();
+  if (raw && raw.date === today) {
+    return {
+      date: today,
+      shadow: !!raw.shadow,
+      reflex: !!raw.reflex,
+      turns: Number(raw.turns) || 0,
+      review: !!raw.review,
+      streak: Number(raw.streak) || 0,
+    };
+  }
+  // 跨天：昨天完成过 review 才延续 streak
+  const yesterday = new Date();
+  yesterday.setDate(yesterday.getDate() - 1);
+  const yKey = yesterday.getFullYear() + '-' + String(yesterday.getMonth() + 1).padStart(2, '0') + '-' + String(yesterday.getDate()).padStart(2, '0');
+  const streak = raw && raw.date === yKey && raw.review ? (Number(raw.streak) || 0) : 0;
+  return { date: today, shadow: false, reflex: false, turns: 0, review: false, streak };
+}
+let progress = loadProgress();
+const PLAN_TURNS_GOAL = 5;
+
+function bumpProgress(key, value) {
+  if (progress.date !== todayKey()) progress = loadProgress();
+  if (key === 'turns') progress.turns = Math.max(progress.turns, Number(value) || 0);
+  else progress[key] = true;
+  if (key === 'review' && !progress._streakCounted) {
+    progress.streak = (progress.streak || 0) + 1;
+    progress._streakCounted = true;
+  }
+  store.set(PROGRESS_KEY, progress);
+  renderTodayPlan();
+}
 
 function sanitizeHistoryItem(h) {
   if (!h || typeof h !== 'object') return null;
@@ -492,8 +540,10 @@ function renderWelcome() {
     '<p class="welcome-title">Pick a lane. Say a number.</p>' +
     '<div class="welcome-actions">' +
     '<button type="button" class="btn btn-primary" id="btn-start-shadow">跟读 · 会议节奏</button>' +
+    '<button type="button" class="btn btn-primary" id="btn-start-reflex">语块反射 · 3 秒</button>' +
     '</div>' +
-    '<p class="welcome-note">对练前可先打开侧栏「句型」热身；设置里可开 3 秒开口 / 严格纠错。</p>' +
+    '<div class="today-plan" id="today-plan"></div>' +
+    '<p class="welcome-note">建议顺序：跟读热身 → 语块反射 → 对练 5 轮 → 结束复盘。设置里可开 3 秒开口 / 严格纠错 / 先流畅后纠错。</p>' +
     '<ul class="welcome-list"></ul>';
   const list = welcomeEl.querySelector('.welcome-list');
   currentPersona.scenarios.forEach((s, i) => {
@@ -503,7 +553,39 @@ function renderWelcome() {
     list.appendChild(li);
   });
   const shadowBtn = welcomeEl.querySelector('#btn-start-shadow');
-  if (shadowBtn) shadowBtn.addEventListener('click', startShadowing);
+  if (shadowBtn) shadowBtn.addEventListener('click', () => startShadowing('shadow'));
+  const reflexBtn = welcomeEl.querySelector('#btn-start-reflex');
+  if (reflexBtn) reflexBtn.addEventListener('click', () => startShadowing('reflex'));
+  renderTodayPlan();
+}
+
+function renderTodayPlan() {
+  const el = $('today-plan');
+  if (!el) return;
+  if (progress.date !== todayKey()) progress = loadProgress();
+  const steps = [
+    { key: 'shadow', label: '跟读 1 组', done: progress.shadow, sub: '约 1 分钟', act: () => startShadowing('shadow') },
+    { key: 'reflex', label: '语块反射 1 组', done: progress.reflex, sub: '10 题', act: () => startShadowing('reflex') },
+    { key: 'turns', label: '对练 ' + PLAN_TURNS_GOAL + ' 轮', done: progress.turns >= PLAN_TURNS_GOAL, sub: progress.turns + '/' + PLAN_TURNS_GOAL, act: () => startSession(scenarioSelect.value || currentPersona.scenarios[0].id) },
+    { key: 'review', label: '结束复盘', done: progress.review, sub: '沉淀错题', act: () => { if (session) endReview(); else startSession(scenarioSelect.value || currentPersona.scenarios[0].id); } },
+  ];
+  const doneCount = steps.filter((s) => s.done).length;
+  el.innerHTML = '';
+  const head = document.createElement('div');
+  head.className = 'today-plan-head';
+  head.innerHTML = '<strong>今日训练 ' + doneCount + '/4</strong><span>连续 ' + (progress.streak || 0) + ' 天 · 每天 15 分钟比周末突击更有效</span>';
+  el.appendChild(head);
+  const row = document.createElement('div');
+  row.className = 'today-steps';
+  steps.forEach((s) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'today-step' + (s.done ? ' done' : '');
+    b.innerHTML = '<span class="mark">' + (s.done ? '✓' : '○') + '</span><span>' + escapeHtml(s.label) + '</span><span class="sub">' + escapeHtml(s.sub) + '</span>';
+    b.addEventListener('click', s.act);
+    row.appendChild(b);
+  });
+  el.appendChild(row);
 }
 
 /* ---------------------------- 会话管理 ------------------------------ */
@@ -580,10 +662,14 @@ function renderMessage(role, text, correction, focus, errors) {
   }
   wrap.appendChild(bubble);
 
-  if (correction) {
+  if (correction && !shouldDeferCorrection()) {
     wrap.appendChild(buildCorrectionCard(correction, focus, errors));
   }
   chatEl.appendChild(wrap);
+}
+
+function shouldDeferCorrection() {
+  return !!config.deferCorrection && !restoring;
 }
 
 function normalizeErrors(errors) {
@@ -975,7 +1061,7 @@ function finalizeStreamingDave(ui, reply, correction, focus, errors) {
     spk.addEventListener('click', () => speak(reply));
     ui.bubble.appendChild(spk);
   }
-  if (correction) {
+  if (correction && !shouldDeferCorrection()) {
     ui.wrap.appendChild(buildCorrectionCard(correction, focus, errors));
   }
   if (session) {
@@ -987,7 +1073,12 @@ function finalizeStreamingDave(ui, reply, correction, focus, errors) {
 async function handleUserTurn() {
   const text = inputEl.value.trim();
   if (!text || turnBusy) return;
-  if (shadowState.active) return;
+  if (shadowState.active) {
+    inputEl.value = '';
+    autoResize();
+    handleShadowTranscript(text, '');
+    return;
+  }
   turnBusy = true;
   markChallengeOpened();
   clearChallenge();
@@ -1034,6 +1125,7 @@ async function handleUserTurn() {
       addMessage('dave', reply, correction, focus, errors);
     }
     turnBusy = false;
+    bumpProgress('turns', session.messages.filter((m) => m.role === 'user').length);
     await speakThenMaybeListen(reply);
   } catch (err) {
     if (gen !== requestGen) {
@@ -1081,17 +1173,24 @@ async function endReview() {
       .filter((m) => m.role === 'user' || m.role === 'dave')
       .map((m) => `${m.role === 'user' ? 'You' : currentPersona.label}: ${m.text}`)
       .join('\n');
+    const deferredCards = session.messages.filter((m) => m.role === 'dave' && m.correction);
+    const deferred = !!config.deferCorrection && deferredCards.length > 0;
+    const corrNotes = deferred
+      ? '\n\n逐轮纠错记录：\n' + deferredCards.map((m, i) => `#${i + 1}\n${m.correction}`).join('\n')
+      : '';
     const sys = [
       '你是英语口语教练。根据下面这段英文口语练习对话，用中文写一段复盘。',
       '只输出一个 JSON：{"review":"..."}',
       'review 用三小段（可换行）：',
       '① 今日复盘：一句话概括今天练得怎么样（点出 1 个亮点 + 1 个问题）。',
       '② 明天重点：给 1-2 条具体可执行的练习建议。',
-      '③ 最该补的一个表达：给出一个英文表达 + 一句中文说明为什么重要、怎么用。',
+      deferred
+        ? '③ 最该改的 3 个错误：从纠错记录里挑出最影响沟通的 3 个（合并同类），每条一行：错误 → 正确说法 → 一句中文原因。'
+        : '③ 最该补的一个表达：给出一个英文表达 + 一句中文说明为什么重要、怎么用。',
       '直接给内容，不要寒暄。',
     ].join('\n');
     const raw = await chatCompletion(
-      [{ role: 'user', content: '练习对话：\n' + transcript }],
+      [{ role: 'user', content: '练习对话：\n' + transcript + corrNotes }],
       sys,
       { json: true }
     );
@@ -1103,8 +1202,16 @@ async function endReview() {
     const box = document.createElement('div');
     box.className = 'review-card';
     box.innerHTML = '<h3>📋 今日复盘 · 明天重点</h3>' + escapeHtml(reviewText).replace(/\n/g, '<br>');
+    if (deferred) {
+      const sum = document.createElement('div');
+      sum.className = 'deferred-summary';
+      sum.innerHTML = '<h4>本次对练的逐轮纠错（' + deferredCards.length + ' 条，点 ☆ 收藏进表达库）</h4>';
+      deferredCards.forEach((m) => sum.appendChild(buildCorrectionCard(m.correction, m.focus, m.errors)));
+      box.appendChild(sum);
+    }
     card.appendChild(box);
     chatEl.appendChild(card);
+    bumpProgress('review');
     scrollToBottom();
   } catch (err) {
     if (gen !== requestGen) return;
@@ -1440,6 +1547,9 @@ function setupRecognition() {
   r.lang = 'en-US';
   r.interimResults = true;
   r.continuous = false;
+  r.onspeechstart = () => {
+    if (shadowState.active && shadowState.mode === 'reflex') markReflexOpened();
+  };
   r.onresult = (e) => {
     let final = '';
     let interim = '';
@@ -1633,6 +1743,7 @@ function restoreSession(h) {
     messages: [],
   };
   resetChatView(false);
+  restoring = true;
   messages.forEach((m) => {
     session.messages.push({
       role: m.role,
@@ -1643,6 +1754,7 @@ function restoreSession(h) {
     });
     renderMessage(m.role, m.text, m.correction, m.focus, m.errors);
   });
+  restoring = false;
   scrollToBottom();
   inputEl.focus();
 }
@@ -1737,6 +1849,7 @@ function openSettings() {
   if ($('cfg-handsfree')) $('cfg-handsfree').checked = !!config.handsfree;
   if ($('cfg-strict')) $('cfg-strict').checked = !!config.strict;
   if ($('cfg-threesecond')) $('cfg-threesecond').checked = !!config.threeSecond;
+  if ($('cfg-defer')) $('cfg-defer').checked = !!config.deferCorrection;
   if ($('cfg-industry')) $('cfg-industry').value = config.industry || 'none';
   $('settings-overlay').classList.remove('hidden');
 }
@@ -1753,6 +1866,7 @@ function saveSettings() {
   config.handsfree = $('cfg-handsfree') ? $('cfg-handsfree').checked : false;
   config.strict = $('cfg-strict') ? $('cfg-strict').checked : false;
   config.threeSecond = $('cfg-threesecond') ? $('cfg-threesecond').checked : false;
+  config.deferCorrection = $('cfg-defer') ? $('cfg-defer').checked : false;
   config.industry = $('cfg-industry') ? ($('cfg-industry').value || 'none') : 'none';
   persistOrWarn('dave_config', config);
   closeSettings();
@@ -1779,6 +1893,7 @@ function readSettingsForm() {
     handsfree: $('cfg-handsfree') ? $('cfg-handsfree').checked : config.handsfree,
     strict: $('cfg-strict') ? $('cfg-strict').checked : config.strict,
     threeSecond: $('cfg-threesecond') ? $('cfg-threesecond').checked : config.threeSecond,
+    deferCorrection: $('cfg-defer') ? $('cfg-defer').checked : config.deferCorrection,
     industry: $('cfg-industry') ? ($('cfg-industry').value || 'none') : config.industry,
   };
 }
@@ -1816,6 +1931,19 @@ function renderTemplateCard(item, listEl) {
     zh.textContent = item.zh;
     card.appendChild(zh);
   }
+  if (item.example) {
+    const ex = document.createElement('div');
+    ex.className = 'example';
+    ex.innerHTML = '<b>例句</b>' + escapeHtml(item.example);
+    card.appendChild(ex);
+  }
+  if (item.variant) {
+    const va = document.createElement('div');
+    va.className = 'variant';
+    va.innerHTML = '<b>变形</b>' + escapeHtml(item.variant);
+    card.appendChild(va);
+  }
+  const speakText = item.example || item.en;
   const actions = document.createElement('div');
   actions.className = 'tpl-actions';
   const fill = document.createElement('button');
@@ -1825,9 +1953,24 @@ function renderTemplateCard(item, listEl) {
   const shadowOne = document.createElement('button');
   shadowOne.type = 'button';
   shadowOne.textContent = '跟读';
-  shadowOne.addEventListener('click', () => speak(item.en, { rate: 0.95 }));
+  shadowOne.addEventListener('click', () => speak(speakText, { rate: 0.95 }));
+  const save = document.createElement('button');
+  save.type = 'button';
+  const saved = () => phrases.some((p) => p.en === speakText);
+  save.textContent = saved() ? '已收藏' : '收藏';
+  save.addEventListener('click', () => {
+    if (saved()) {
+      phrases = phrases.filter((p) => p.en !== speakText);
+    } else {
+      phrases.unshift({ en: speakText, scenarioName: '语块 · ' + (item.label || ''), ts: Date.now() });
+    }
+    persistOrWarn('dave_phrasebook', phrases);
+    renderPhrasebook();
+    save.textContent = saved() ? '已收藏' : '收藏';
+  });
   actions.appendChild(fill);
   actions.appendChild(shadowOne);
+  actions.appendChild(save);
   card.appendChild(actions);
   listEl.appendChild(card);
 }
@@ -1884,41 +2027,143 @@ function setShadowFeedback(text, kind) {
   if (kind) el.classList.add(kind);
 }
 
+const REFLEX_SECONDS = 3;
+const REFLEX_PASS = 0.6;
+const SHADOW_PASS = 0.7;
+
+function isReflex() {
+  return shadowState.mode === 'reflex';
+}
+
+/* 语块反射的题目：用中文场景 cue 触发，对答案的「语块骨架」计分 */
+function buildReflexLines() {
+  const templates = typeof MEETING_TEMPLATES !== 'undefined' ? MEETING_TEMPLATES : [];
+  return templates
+    .filter((t) => t.example)
+    .map((t) => ({
+      zh: (t.label ? '【' + t.label + '】' : '') + (t.cue || t.zh || ''),
+      en: t.example,
+      stem: t.en.replace(/\.\.\./g, ' '),
+      variant: t.variant || '',
+    }));
+}
+
+function stopReflexTimer() {
+  shadowState.timerGen += 1;
+  if (shadowState.timerRaf) {
+    cancelAnimationFrame(shadowState.timerRaf);
+    shadowState.timerRaf = null;
+  }
+}
+
+function setReflexTimerState(cls, num) {
+  const t = $('shadow-timer');
+  if (!t) return;
+  t.classList.remove('passed', 'missed');
+  if (cls) t.classList.add(cls);
+  if (num != null) $('shadow-timer-num').textContent = num;
+}
+
+function startReflexTimer() {
+  stopReflexTimer();
+  const gen = shadowState.timerGen;
+  const started = performance.now();
+  const duration = REFLEX_SECONDS * 1000;
+  setReflexTimerState(null, REFLEX_SECONDS.toFixed(1));
+  const tick = (now) => {
+    if (gen !== shadowState.timerGen || !shadowState.active) return;
+    const left = Math.max(0, duration - (now - started));
+    $('shadow-timer-num').textContent = (left / 1000).toFixed(1);
+    if (left <= 0) {
+      setReflexTimerState('missed', '0.0');
+      if (!shadowState.answered) {
+        setShadowFeedback('超时。先蹦出语块开头（如 "Actually, I think..."），再补内容。可以「看答案」或直接说完。', 'bad');
+      }
+      return;
+    }
+    shadowState.timerRaf = requestAnimationFrame(tick);
+  };
+  shadowState.timerRaf = requestAnimationFrame(tick);
+}
+
+function markReflexOpened() {
+  if (!shadowState.active || !isReflex() || shadowState.answered) return;
+  const t = $('shadow-timer');
+  if (t && !t.classList.contains('missed')) {
+    stopReflexTimer();
+    setReflexTimerState('passed', '✓');
+  }
+}
+
+function revealShadowAnswer() {
+  const en = $('shadow-en');
+  if (en) en.classList.remove('masked');
+  const btn = $('btn-shadow-reveal');
+  if (btn) btn.classList.add('hidden');
+}
+
 function renderShadowLine() {
   const total = shadowState.lines.length || 1;
   const idx = Math.min(shadowState.index, total - 1);
   const line = shadowState.lines[idx] || { en: '', zh: '' };
+  const reflex = isReflex();
+  shadowState.answered = false;
   $('shadow-step-label').textContent = (idx + 1) + ' / ' + total;
   $('shadow-progress-fill').style.width = (((idx + 1) / total) * 100).toFixed(1) + '%';
   $('shadow-zh').textContent = line.zh || '';
-  $('shadow-en').textContent = line.en || '';
-  setShadowFeedback('', null);
+  const en = $('shadow-en');
+  en.textContent = line.en || '';
+  en.classList.toggle('masked', reflex);
+  $('shadow-timer').classList.toggle('hidden', !reflex);
+  $('btn-shadow-reveal').classList.toggle('hidden', !reflex);
+  $('shadow-rate-wrap').classList.toggle('hidden', reflex);
+  $('btn-shadow-play').classList.toggle('hidden', reflex);
+  $('btn-shadow-mic').textContent = reflex ? '🎤 说出来' : '🎤 跟读';
+  $('btn-shadow-next').textContent = reflex ? '下一题' : '下一句';
+  const score = $('shadow-score-label');
+  score.classList.toggle('hidden', !reflex);
+  score.textContent = shadowState.hits + ' 命中';
+  setShadowFeedback(reflex ? '看中文提示，' + REFLEX_SECONDS + ' 秒内开口说出对应语块。' : '', null);
+  if (reflex) startReflexTimer();
+  else stopReflexTimer();
 }
 
-function startShadowing() {
+function startShadowing(mode) {
   clearChallenge();
   pauseHandsfree();
+  stopTTS();
   session = null;
   resetChatView(false);
   welcomeEl.classList.add('hidden');
   if (chatEl) chatEl.classList.add('hidden');
   const panel = $('shadow-panel');
   if (panel) panel.classList.remove('hidden');
+  shadowState.mode = mode === 'reflex' ? 'reflex' : 'shadow';
   shadowState.active = true;
   shadowState.index = 0;
+  shadowState.hits = 0;
   shadowState.listening = false;
-  shadowState.lines = (typeof SHADOWING_LINES !== 'undefined' ? SHADOWING_LINES : []).slice();
+  const reflex = isReflex();
+  $('shadow-title').textContent = reflex ? '语块反射 · 3 秒' : '跟读 · 会议节奏';
+  $('shadow-sub').textContent = reflex
+    ? '看中文场景 → 3 秒内说出对应英文语块。练的是「不经思考就调取」，说出语块骨架即算命中。'
+    : '听一句 → 马上跟说（每句 8–12 词）。比的是用词和节奏，不是发音打分。';
+  shadowState.lines = reflex
+    ? buildReflexLines()
+    : (typeof SHADOWING_LINES !== 'undefined' ? SHADOWING_LINES : []).slice();
   if (!shadowState.lines.length) {
-    setShadowFeedback('跟读句子未加载。', 'bad');
+    setShadowFeedback('练习内容未加载。', 'bad');
     return;
   }
   renderShadowLine();
   inputEl.value = '';
   autoResize();
+  inputEl.focus();
 }
 
 function exitShadowing(opts) {
   const wasActive = shadowState.active;
+  stopReflexTimer();
   shadowState.active = false;
   shadowState.listening = false;
   shadowState.index = 0;
@@ -1948,7 +2193,7 @@ function startShadowMic() {
   inputEl.value = '';
   autoResize();
   shadowState.listening = true;
-  setShadowFeedback('正在听你跟读…', null);
+  setShadowFeedback(isReflex() ? '正在听…直接说出语块。' : '正在听你跟读…', null);
   startMic('shadow');
 }
 
@@ -1957,30 +2202,61 @@ function handleShadowTranscript(spoken, err) {
   const line = shadowState.lines[shadowState.index];
   if (!line) return;
   if (!spoken) {
-    setShadowFeedback(err === 'no-speech' ? '没听清，再来一遍。' : '没听到内容，点「跟读」再试。', 'bad');
+    setShadowFeedback(err === 'no-speech' ? '没听清，再来一遍。' : '没听到内容，点麦克风或在下方打字。', 'bad');
     return;
   }
-  const result = scoreShadow(line.en, spoken);
-  if (result.score >= 0.7) {
-    setShadowFeedback(
-      '跟上了（约 ' + Math.round(result.score * 100) + '% 词命中）。可以下一句。',
-      'ok'
-    );
+  const reflex = isReflex();
+  const target = reflex ? line.stem : line.en;
+  const result = scoreShadow(target, spoken);
+  const pct = Math.round(result.score * 100);
+  const pass = result.score >= (reflex ? REFLEX_PASS : SHADOW_PASS);
+
+  if (reflex) {
+    markReflexOpened();
+    revealShadowAnswer();
+    const timedOut = $('shadow-timer').classList.contains('missed');
+    if (pass) {
+      if (!shadowState.answered) shadowState.hits += 1;
+      shadowState.answered = true;
+      $('shadow-score-label').textContent = shadowState.hits + ' 命中';
+      setShadowFeedback(
+        (timedOut ? '语块对了，但慢了。' : '命中！') + '骨架词 ' + pct + '%。' +
+        (line.variant ? ' 变形句：' + line.variant : '') + ' → 下一题',
+        timedOut ? null : 'ok'
+      );
+    } else {
+      shadowState.answered = true;
+      const miss = result.missing.length ? '缺：' + result.missing.join(', ') : '';
+      setShadowFeedback('没调出这个语块。' + miss + ' 对照答案再说一遍，再点下一题。', 'bad');
+    }
+  } else if (pass) {
+    setShadowFeedback('跟上了（约 ' + pct + '% 词命中）。可以下一句。', 'ok');
   } else {
     const miss = result.missing.length ? '漏了：' + result.missing.join(', ') : '节奏偏了';
-    setShadowFeedback(
-      '再跟一遍。命中约 ' + Math.round(result.score * 100) + '%。' + miss,
-      'bad'
-    );
+    setShadowFeedback('再跟一遍。命中约 ' + pct + '%。' + miss, 'bad');
   }
   inputEl.value = '';
   autoResize();
 }
 
+function finishShadowSet() {
+  stopReflexTimer();
+  if (isReflex()) {
+    const total = shadowState.lines.length;
+    const rate = total ? Math.round((shadowState.hits / total) * 100) : 0;
+    const verdict = rate >= 80 ? '这组语块基本成条件反射了。' : rate >= 50 ? '一半能调出来，明天再刷一遍。' : '还在「想」而不是「调」，建议先跟读一组再回来。';
+    setShadowFeedback('本组完成：' + shadowState.hits + '/' + total + '（' + rate + '%）。' + verdict + ' 点「再来一遍」重刷，或退出去对练。', 'ok');
+    bumpProgress('reflex');
+  } else {
+    setShadowFeedback('本组跟读完成。可以退出去对练，或点「再来一遍」从第一句重练。', 'ok');
+    bumpProgress('shadow');
+  }
+}
+
 function nextShadowLine() {
   if (!shadowState.active) return;
   if (shadowState.index >= shadowState.lines.length - 1) {
-    setShadowFeedback('本组跟读完成。可以退出，或点「再来一遍」从第一句重练。', 'ok');
+    finishShadowSet();
     return;
   }
   shadowState.index += 1;
@@ -1989,12 +2265,13 @@ function nextShadowLine() {
 
 function retryShadowLine() {
   if (!shadowState.active) return;
-  if (shadowState.index >= shadowState.lines.length - 1 &&
-      $('shadow-feedback') && /完成/.test($('shadow-feedback').textContent || '')) {
+  const fb = $('shadow-feedback');
+  if (shadowState.index >= shadowState.lines.length - 1 && fb && /完成/.test(fb.textContent || '')) {
     shadowState.index = 0;
+    shadowState.hits = 0;
   }
   renderShadowLine();
-  playShadowLine();
+  if (!isReflex()) playShadowLine();
 }
 
 async function testConnection() {
@@ -2097,6 +2374,13 @@ function bindEvents() {
   if (nextShadow) nextShadow.addEventListener('click', nextShadowLine);
   const retryShadow = $('btn-shadow-retry');
   if (retryShadow) retryShadow.addEventListener('click', retryShadowLine);
+  const revealShadow = $('btn-shadow-reveal');
+  if (revealShadow) revealShadow.addEventListener('click', () => {
+    revealShadowAnswer();
+    shadowState.answered = true;
+    stopReflexTimer();
+    setShadowFeedback('看完答案，照着说一遍再点下一题（本题不计命中）。', null);
+  });
 }
 
 function switchSidebarTab(name) {
