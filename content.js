@@ -255,3 +255,28 @@ const SHADOWING_LINES = [
     zh: '用经验支撑判断',
   },
 ];
+
+/* 半句暂停：听前半句，猜/补出后半语块（由例句自动切分时可不用手写） */
+const HALF_PAUSE_LINES = (typeof MEETING_TEMPLATES !== 'undefined' ? MEETING_TEMPLATES : [])
+  .filter((t) => t.example)
+  .map((t) => {
+    const words = String(t.example).trim().split(/\s+/);
+    const cut = Math.max(2, Math.min(words.length - 2, Math.floor(words.length * 0.45)));
+    return {
+      zh: (t.label ? '【' + t.label + '】' : '') + (t.cue || t.zh || ''),
+      en: t.example,
+      stem: String(t.en || '').replace(/\.\.\./g, ' '),
+      head: words.slice(0, cut).join(' '),
+      tail: words.slice(cut).join(' '),
+      variant: t.variant || '',
+    };
+  });
+
+/* 语块教练可选主题（会议向） */
+const COACH_TOPICS = [
+  { id: 'workload', label: '工作压力 / 排期', hint: 'snowed under, on my plate, push back' },
+  { id: 'alignment', label: '对齐与澄清', hint: "just to make sure we're aligned, what I meant was" },
+  { id: 'pushback', label: '礼貌反对 / 砍范围', hint: 'correct me if I\'m wrong, what if we' },
+  { id: 'update', label: '进度更新与承诺', hint: "I'll own that, you'll have an update by" },
+  { id: 'incident', label: '线上故障沟通', hint: 'root cause, mitigation, next update' },
+];

@@ -387,7 +387,7 @@ let requestGen = 0;
 
 const shadowState = {
   active: false,
-  mode: 'shadow', // 'shadow' 跟读 | 'reflex' 语块反射
+  mode: 'shadow', // 'shadow' 跟读 | 'reflex' 语块反射 | 'pause' 半句暂停
   index: 0,
   lines: [],
   listening: false,
@@ -397,6 +397,8 @@ const shadowState = {
   timerGen: 0,
 };
 let restoring = false;
+let resayTarget = null; // recast 重说目标句
+let coachTopicId = '';
 
 /* ------------------------- 今日训练进度（本机） ---------------------- */
 const PROGRESS_KEY = 'dave_progress';
@@ -412,6 +414,7 @@ function loadProgress() {
       date: today,
       shadow: !!raw.shadow,
       reflex: !!raw.reflex,
+      coach: !!raw.coach,
       turns: Number(raw.turns) || 0,
       review: !!raw.review,
       streak: Number(raw.streak) || 0,
@@ -422,7 +425,7 @@ function loadProgress() {
   yesterday.setDate(yesterday.getDate() - 1);
   const yKey = yesterday.getFullYear() + '-' + String(yesterday.getMonth() + 1).padStart(2, '0') + '-' + String(yesterday.getDate()).padStart(2, '0');
   const streak = raw && raw.date === yKey && raw.review ? (Number(raw.streak) || 0) : 0;
-  return { date: today, shadow: false, reflex: false, turns: 0, review: false, streak };
+  return { date: today, shadow: false, reflex: false, coach: false, turns: 0, review: false, streak };
 }
 let progress = loadProgress();
 const PLAN_TURNS_GOAL = 5;
@@ -477,9 +480,13 @@ function sanitizePhraseItem(p) {
   const en = String(p.en == null ? '' : p.en).trim();
   if (!en) return null;
   const ts = Number(p.ts);
+  const mastery = String(p.mastery || '');
   return {
     en,
     scenarioName: String(p.scenarioName == null ? '' : p.scenarioName),
+    zh: String(p.zh == null ? '' : p.zh),
+    cue: String(p.cue == null ? '' : p.cue),
+    mastery: /^(active|cued|need)$/.test(mastery) ? mastery : '',
     ts: Number.isFinite(ts) ? ts : Date.now(),
   };
 }
@@ -541,9 +548,11 @@ function renderWelcome() {
     '<div class="welcome-actions">' +
     '<button type="button" class="btn btn-primary" id="btn-start-shadow">跟读 · 会议节奏</button>' +
     '<button type="button" class="btn btn-primary" id="btn-start-reflex">语块反射 · 3 秒</button>' +
+    '<button type="button" class="btn btn-primary" id="btn-start-pause">半句暂停</button>' +
+    '<button type="button" class="btn btn-primary" id="btn-start-coach">语块教练 · 15 分钟</button>' +
     '</div>' +
     '<div class="today-plan" id="today-plan"></div>' +
-    '<p class="welcome-note">建议顺序：跟读热身 → 语块反射 → 对练 5 轮 → 结束复盘。设置里可开 3 秒开口 / 严格纠错 / 先流畅后纠错。</p>' +
+    '<p class="welcome-note">按文章闭环：听见/跟读 → 反射提取 →（可选）语块教练 → 对练 5 轮 → 复盘诊断。设置可开 3 秒开口 / 严格纠错 / 先流畅后纠错。</p>' +
     '<ul class="welcome-list"></ul>';
   const list = welcomeEl.querySelector('.welcome-list');
   currentPersona.scenarios.forEach((s, i) => {
@@ -556,6 +565,10 @@ function renderWelcome() {
   if (shadowBtn) shadowBtn.addEventListener('click', () => startShadowing('shadow'));
   const reflexBtn = welcomeEl.querySelector('#btn-start-reflex');
   if (reflexBtn) reflexBtn.addEventListener('click', () => startShadowing('reflex'));
+  const pauseBtn = welcomeEl.querySelector('#btn-start-pause');
+  if (pauseBtn) pauseBtn.addEventListener('click', () => startShadowing('pause'));
+  const coachBtn = welcomeEl.querySelector('#btn-start-coach');
+  if (coachBtn) coachBtn.addEventListener('click', startCoachSession);
   renderTodayPlan();
 }
 
@@ -565,15 +578,16 @@ function renderTodayPlan() {
   if (progress.date !== todayKey()) progress = loadProgress();
   const steps = [
     { key: 'shadow', label: '跟读 1 组', done: progress.shadow, sub: '约 1 分钟', act: () => startShadowing('shadow') },
-    { key: 'reflex', label: '语块反射 1 组', done: progress.reflex, sub: '10 题', act: () => startShadowing('reflex') },
+    { key: 'reflex', label: '语块反射', done: progress.reflex, sub: '10 题', act: () => startShadowing('reflex') },
+    { key: 'coach', label: '语块教练', done: progress.coach, sub: '15 分钟 / 3 块', act: () => startCoachSession() },
     { key: 'turns', label: '对练 ' + PLAN_TURNS_GOAL + ' 轮', done: progress.turns >= PLAN_TURNS_GOAL, sub: progress.turns + '/' + PLAN_TURNS_GOAL, act: () => startSession(scenarioSelect.value || currentPersona.scenarios[0].id) },
-    { key: 'review', label: '结束复盘', done: progress.review, sub: '沉淀错题', act: () => { if (session) endReview(); else startSession(scenarioSelect.value || currentPersona.scenarios[0].id); } },
+    { key: 'review', label: '复盘诊断', done: progress.review, sub: '提炼缺失语块', act: () => { if (session) endReview(); else startSession(scenarioSelect.value || currentPersona.scenarios[0].id); } },
   ];
   const doneCount = steps.filter((s) => s.done).length;
   el.innerHTML = '';
   const head = document.createElement('div');
   head.className = 'today-plan-head';
-  head.innerHTML = '<strong>今日训练 ' + doneCount + '/4</strong><span>连续 ' + (progress.streak || 0) + ' 天 · 每天 15 分钟比周末突击更有效</span>';
+  head.innerHTML = '<strong>今日训练 ' + doneCount + '/5</strong><span>连续 ' + (progress.streak || 0) + ' 天 · 听见→提取→对练→回收</span>';
   el.appendChild(head);
   const row = document.createElement('div');
   row.className = 'today-steps';
@@ -740,6 +754,30 @@ function buildCorrectionCard(correction, focus, errors) {
     f.className = 'focus';
     f.textContent = '🎯 ' + focus;
     card.appendChild(f);
+  }
+
+  const better = extractBetter(correction);
+  if (better) {
+    const actions = document.createElement('div');
+    actions.className = 'corr-actions';
+    const hear = document.createElement('button');
+    hear.type = 'button';
+    hear.textContent = '听自然版';
+    hear.addEventListener('click', () => speak(better));
+    const resay = document.createElement('button');
+    resay.type = 'button';
+    resay.className = 'primary';
+    resay.textContent = '立刻重说';
+    resay.title = 'Recast：听完后马上自己再说一遍';
+    resay.addEventListener('click', () => startResayDrill(better));
+    const save = document.createElement('button');
+    save.type = 'button';
+    save.textContent = '收进语块库';
+    save.addEventListener('click', () => upsertPhrase(better, '纠错重说', '', '', 'cued'));
+    actions.appendChild(hear);
+    actions.appendChild(resay);
+    actions.appendChild(save);
+    card.appendChild(actions);
   }
   return card;
 }
@@ -1103,7 +1141,9 @@ async function handleUserTurn() {
 
   try {
     const scenario = currentPersona.scenarios.find((s) => s.id === session.scenario) || currentPersona.scenarios[0];
-    const sys = buildSystemPrompt(currentPersona, scenario.name, scenario.desc);
+    const sys = session.mode === 'coach'
+      ? buildCoachSystemPrompt(session.coachTopic || '')
+      : buildSystemPrompt(currentPersona, scenario.name, scenario.desc);
     const messages = buildApiMessages();
     const raw = await chatCompletion(messages, sys, {
       stream: !!config.stream,
@@ -1125,7 +1165,12 @@ async function handleUserTurn() {
       addMessage('dave', reply, correction, focus, errors);
     }
     turnBusy = false;
-    bumpProgress('turns', session.messages.filter((m) => m.role === 'user').length);
+    if (session.mode === 'coach') {
+      const userTurns = session.messages.filter((m) => m.role === 'user').length;
+      if (userTurns >= 6 || /结束|复盘|done|wrap/i.test(text)) bumpProgress('coach');
+    } else {
+      bumpProgress('turns', session.messages.filter((m) => m.role === 'user').length);
+    }
     await speakThenMaybeListen(reply);
   } catch (err) {
     if (gen !== requestGen) {
@@ -1209,6 +1254,21 @@ async function endReview() {
       deferredCards.forEach((m) => sum.appendChild(buildCorrectionCard(m.correction, m.focus, m.errors)));
       box.appendChild(sum);
     }
+    const actions = document.createElement('div');
+    actions.className = 'diagnose-actions';
+    const diag = document.createElement('button');
+    diag.type = 'button';
+    diag.className = 'btn btn-primary';
+    diag.textContent = '诊断提炼 3 个缺失语块';
+    diag.addEventListener('click', () => diagnoseMissingChunks());
+    const pauseBtn = document.createElement('button');
+    pauseBtn.type = 'button';
+    pauseBtn.className = 'btn btn-ghost';
+    pauseBtn.textContent = '半句暂停练搭配';
+    pauseBtn.addEventListener('click', () => startShadowing('pause'));
+    actions.appendChild(diag);
+    actions.appendChild(pauseBtn);
+    box.appendChild(actions);
     card.appendChild(box);
     chatEl.appendChild(card);
     bumpProgress('review');
@@ -1577,6 +1637,10 @@ function setupRecognition() {
       handleShadowTranscript(spoken, err);
       return;
     }
+    if (micSource === 'resay') {
+      handleResayTranscript(spoken || '');
+      return;
+    }
     if (spoken) {
       noSpeechRetries = 0;
       if (!turnBusy) handleUserTurn();
@@ -1767,14 +1831,30 @@ function renderPhrasebook() {
   phrases.forEach((p, idx) => {
     const card = document.createElement('div');
     card.className = 'phrase-card';
-    card.innerHTML = `<div class="en">${escapeHtml(p.en)}</div>`;
+    const masteryLabel = p.mastery === 'active' ? '主动调用' : (p.mastery === 'cued' ? '需提示' : (p.mastery === 'need' ? '仍需复习' : ''));
+    card.innerHTML = '<div class="en">' + escapeHtml(p.en) +
+      (masteryLabel ? '<span class="mastery-chip ' + p.mastery + '">' + masteryLabel + '</span>' : '') +
+      '</div>';
+    if (p.zh || p.cue) {
+      const zh = document.createElement('div');
+      zh.className = 'zh';
+      zh.textContent = p.cue || p.zh;
+      card.appendChild(zh);
+    }
     const meta = document.createElement('div');
     meta.className = 'meta';
-    meta.innerHTML = `<span>${escapeHtml(p.scenarioName || '')}</span>`;
+    meta.innerHTML = '<span>' + escapeHtml(p.scenarioName || '') + '</span>';
     const actions = document.createElement('span');
     const spk = document.createElement('button');
     spk.className = 'speak'; spk.textContent = '🔊'; spk.title = '朗读';
     spk.addEventListener('click', () => speak(p.en));
+    const cycle = document.createElement('button');
+    cycle.className = 'speak'; cycle.textContent = '掌握度'; cycle.title = '切换：仍需复习 → 需提示 → 主动调用';
+    cycle.addEventListener('click', () => {
+      const order = ['need', 'cued', 'active', ''];
+      const i = Math.max(0, order.indexOf(p.mastery || ''));
+      setPhraseMastery(p.en, order[(i + 1) % order.length]);
+    });
     const del = document.createElement('button');
     del.className = 'del'; del.textContent = '删除';
     del.addEventListener('click', () => {
@@ -1783,7 +1863,7 @@ function renderPhrasebook() {
       renderPhrasebook();
       updateSpeakAllBtn();
     });
-    actions.appendChild(spk); actions.appendChild(del);
+    actions.appendChild(spk); actions.appendChild(cycle); actions.appendChild(del);
     meta.appendChild(actions);
     card.appendChild(meta);
     el.appendChild(card);
@@ -1994,6 +2074,208 @@ function renderTemplates() {
   pack.jargon.forEach((j) => renderTemplateCard({ en: j.en, zh: j.zh, label: pack.label }, jarEl));
 }
 
+
+/* ======================== 语块教练 / Recast / 诊断 ======================== */
+function upsertPhrase(en, scenarioName, zh, cue, mastery) {
+  const text = String(en || '').trim();
+  if (!text) return;
+  const existing = phrases.find((p) => p.en === text);
+  if (existing) {
+    if (zh) existing.zh = zh;
+    if (cue) existing.cue = cue;
+    if (mastery) existing.mastery = mastery;
+    if (scenarioName) existing.scenarioName = scenarioName;
+  } else {
+    phrases.unshift({
+      en: text,
+      scenarioName: scenarioName || '',
+      zh: zh || '',
+      cue: cue || '',
+      mastery: mastery || 'need',
+      ts: Date.now(),
+    });
+  }
+  persistOrWarn('dave_phrasebook', phrases);
+  renderPhrasebook();
+  updateSpeakAllBtn();
+}
+
+function setPhraseMastery(en, mastery) {
+  const p = phrases.find((x) => x.en === en);
+  if (!p) return;
+  p.mastery = mastery;
+  persistOrWarn('dave_phrasebook', phrases);
+  renderPhrasebook();
+}
+
+function buildCoachSystemPrompt(topicLabel) {
+  const pack = getIndustryPack();
+  const jargon = (pack.jargon || []).slice(0, 4).map((j) => j.en).join(' / ');
+  return [
+    'You are my Lexical Chunk Speaking Coach for English meetings.',
+    'Goal: in one voice-friendly session, train exactly 3 high-frequency, modern, transferable chunks from "I understand them" to "I can retrieve them under pressure".',
+    'Do NOT free-chat aimlessly. Do NOT lecture grammar. Prefer recasts over interruptions.',
+    '',
+    'My settings:',
+    '- Level: B1-B2',
+    '- Topic: ' + (topicLabel || 'workplace meetings') + (jargon ? ' (flavor: ' + jargon + ')' : ''),
+    '- Chunk count: 3',
+    '- Accent preference: American English',
+    '- Brief Chinese explanations OK when I ask or when stuck; otherwise stay in English',
+    '- Correction intensity: light-medium; only fix meaning-breaking / Chinglish / chunk-related errors',
+    '',
+    'Chunk selection rules:',
+    '1) Prefer high-frequency, modern, transferable meeting expressions.',
+    '2) No rare slang, outdated idioms, or one-off lines.',
+    '3) Teach each chunk as a whole — never as isolated words.',
+    '',
+    'Follow these stages in order (keep each turn short; one question at a time; wait for me):',
+    '1 SOUND: Tell a 40-60s mini story/dialogue that naturally contains the 3 chunks. Do NOT name them yet. Then ask one gist question.',
+    '2 NOTICE: Reveal the 3 target chunks. For each: meaning, scene, common collocates, register, one natural example. Read each twice (normal + slightly slower).',
+    '3 IMITATE: Drill one chunk at a time with repetition. Flag only clarity-breaking pronunciation/stress/linking issues. If unsure you heard me, say so.',
+    '4 CONNECT: Ask one real-life question at a time so I answer WITH the target chunk. Prefer scenes/images over Chinese translation prompts.',
+    '5 RETRIEVE: Give a scene and make me recall which chunk fits. Hints order: context → first word → full chunk.',
+    '6 ROLEPLAY: 5-8 short turns. One question each time. Make me reuse each chunk in at least 3 different scenes.',
+    '7 RECAST: Do not interrupt every small mistake. Say "A more natural way to say that is: ..." then make me repeat immediately. Max one teaching point per turn.',
+    '8 SPACED RECALL: After 3-5 other turns, quietly set a new scene for an earlier chunk.',
+    '9 BLIND TEST: Give 3 new scenes without showing the chunks. Check active retrieval.',
+    '10 WRAP: When I say "结束/复盘/done", summarize in Chinese: the 3 chunks, collocates, my original vs natural versions, status (主动调用/需要提示/仍需复习), and 3 review questions for tomorrow.',
+    '',
+    'Output ONLY JSON:',
+    '{"reply":"your short coach turn (1-4 sentences; spoken style)","correction":"① 你说的是：...\n② 更地道的是：...\n③ 为什么：... (or empty if nothing to fix)","focus":"one short Chinese line on the stage goal or the chunk being trained","errors":[]}',
+    'Keep "reply" as coaching dialogue. Put teaching notes in focus/correction, not as a long lecture.',
+  ].join('\n');
+}
+
+function startCoachSession() {
+  exitShadowing({ silent: true });
+  clearChallenge();
+  pauseHandsfree();
+  const topics = typeof COACH_TOPICS !== 'undefined' ? COACH_TOPICS : [];
+  const topic = topics[Math.floor(Math.random() * Math.max(topics.length, 1))] || { id: 'workload', label: '工作压力 / 排期' };
+  coachTopicId = topic.id || '';
+  const scenario = currentPersona.scenarios[0];
+  session = {
+    id: Date.now(),
+    persona: currentPersona.id,
+    scenario: scenario ? scenario.id : 'coach',
+    mode: 'coach',
+    coachTopic: topic.label || 'workplace meetings',
+    messages: [],
+  };
+  if (scenario) scenarioSelect.value = scenario.id;
+  resetChatView(false);
+  const intro = 'Chunk coach mode · topic: ' + (topic.label || 'meetings') + '. I will train 3 reusable chunks with you. Ready? Say yes, or tell me another meeting topic.';
+  addMessage('dave', intro, null, '语块教练：每次只练 3 个可迁移语块。流程：听见→注意→模仿→连接现实→提取→角色扮演→recast→间隔回收→盲测。');
+  const badge = document.createElement('div');
+  badge.className = 'msg system';
+  badge.innerHTML = '<div class="bubble"><span class="coach-badge">语块教练 · 15 分钟</span>主题：' + escapeHtml(topic.label || '') + (topic.hint ? ' · 可迁移方向：' + escapeHtml(topic.hint) : '') + '。随时说「结束」进入文字复盘。</div>';
+  chatEl.appendChild(badge);
+  speakThenMaybeListen(intro);
+  inputEl.focus();
+}
+
+async function startResayDrill(text) {
+  const target = String(text || '').trim();
+  if (!target) return;
+  resayTarget = target;
+  addMessage('system', '🔁 Recast 重说：先听自然版，然后立刻自己说一遍（可打字或开麦）。\n目标：' + target, null, null);
+  await speak(target);
+  if (!isRecording) startMic('resay');
+}
+
+function handleResayTranscript(spoken) {
+  const target = resayTarget;
+  resayTarget = null;
+  if (!target) return;
+  const result = scoreShadow(target, spoken || '');
+  const pct = Math.round(result.score * 100);
+  if (result.score >= 0.7) {
+    addMessage('system', '✅ 重说过关（约 ' + pct + '% 词命中）。这个自然版可以收进语块库。', null, null);
+    upsertPhrase(target, 'Recast', '', '', 'cued');
+  } else {
+    const miss = result.missing.length ? '还缺：' + result.missing.join(', ') : '再靠近一点自然版';
+    addMessage('system', '再试一次。命中约 ' + pct + '%。' + miss + '。目标：' + target, null, null);
+    resayTarget = target;
+  }
+}
+
+async function diagnoseMissingChunks() {
+  if (!session || !session.messages.length) {
+    addMessage('system', '还没有对练内容，先聊几轮再诊断。', null, null);
+    return;
+  }
+  const transcript = session.messages
+    .filter((m) => m.role === 'user' || m.role === 'dave')
+    .map((m) => (m.role === 'user' ? 'You: ' : 'Partner: ') + m.text)
+    .join('\n');
+  const typing = showTyping();
+  try {
+    const sys = [
+      '你是英语口语诊断教练。根据对话，找出学习者最需要的 3 个会议语块。',
+      '只输出 JSON：{"chunks":[{"en":"chunk template or sentence","zh":"中文意思","cue":"中文场景提示","example":"自然例句"}]}',
+      '选取原则：高频、可迁移、现代会议英语；针对用户的简单词重复、中式英语、卡住处；不要生僻俚语。',
+    ].join('\n');
+    const raw = await chatCompletion(
+      [{ role: 'user', content: '对话：\n' + transcript }],
+      sys,
+      { json: true }
+    );
+    const parsed = parseJson(raw) || {};
+    const chunks = Array.isArray(parsed.chunks) ? parsed.chunks.slice(0, 3) : [];
+    if (!chunks.length) throw new Error('未解析到语块');
+    chunks.forEach((c) => {
+      upsertPhrase(c.example || c.en, '诊断提炼', c.zh || '', c.cue || '', 'need');
+    });
+    const card = document.createElement('div');
+    card.className = 'msg system';
+    const box = document.createElement('div');
+    box.className = 'review-card';
+    box.innerHTML = '<h3>🔎 诊断提炼 · 3 个最缺语块</h3>' +
+      chunks.map((c, i) => (
+        '<div style="margin:8px 0"><b>' + (i + 1) + '. ' + escapeHtml(c.en || '') + '</b><br>' +
+        escapeHtml(c.zh || '') + (c.cue ? '<br>场景：' + escapeHtml(c.cue) : '') +
+        (c.example ? '<br>例句：' + escapeHtml(c.example) : '') + '</div>'
+      )).join('');
+    const actions = document.createElement('div');
+    actions.className = 'diagnose-actions';
+    const drill = document.createElement('button');
+    drill.className = 'btn btn-primary';
+    drill.type = 'button';
+    drill.textContent = '用这 3 个做语块反射';
+    drill.addEventListener('click', () => startDiagnoseReflex(chunks));
+    const pause = document.createElement('button');
+    pause.className = 'btn btn-ghost';
+    pause.type = 'button';
+    pause.textContent = '半句暂停练习';
+    pause.addEventListener('click', () => startShadowing('pause'));
+    actions.appendChild(drill);
+    actions.appendChild(pause);
+    box.appendChild(actions);
+    card.appendChild(box);
+    chatEl.appendChild(card);
+    scrollToBottom();
+  } catch (err) {
+    addMessage('system', '⚠️ 诊断失败：' + err.message, null, null);
+  } finally {
+    if (typing.parentNode) typing.remove();
+  }
+}
+
+function startDiagnoseReflex(chunks) {
+  const lines = (chunks || []).map((c) => ({
+    zh: (c.cue || c.zh || '用这个语块回应'),
+    en: c.example || c.en,
+    stem: String(c.en || c.example || '').replace(/\.+\.$/, ' ').replace(/\.\.\./g, ' '),
+  })).filter((l) => l.en);
+  if (!lines.length) return;
+  startShadowing('reflex');
+  shadowState.lines = lines;
+  shadowState.index = 0;
+  shadowState.hits = 0;
+  renderShadowLine();
+}
+
 /* ---------------------------- 跟读模式 ------------------------------ */
 function tokenizeEn(text) {
   return String(text || '')
@@ -2033,6 +2315,9 @@ const SHADOW_PASS = 0.7;
 
 function isReflex() {
   return shadowState.mode === 'reflex';
+}
+function isPause() {
+  return shadowState.mode === 'pause';
 }
 
 /* 语块反射的题目：用中文场景 cue 触发，对答案的「语块骨架」计分 */
@@ -2097,9 +2382,15 @@ function markReflexOpened() {
 
 function revealShadowAnswer() {
   const en = $('shadow-en');
-  if (en) en.classList.remove('masked');
+  const line = shadowState.lines[shadowState.index];
+  if (en && line) {
+    en.classList.remove('masked');
+    en.textContent = line.en || '';
+  }
   const btn = $('btn-shadow-reveal');
   if (btn) btn.classList.add('hidden');
+  const hintBtn = $('btn-shadow-hint');
+  if (hintBtn) hintBtn.classList.add('hidden');
 }
 
 function renderShadowLine() {
@@ -2107,23 +2398,32 @@ function renderShadowLine() {
   const idx = Math.min(shadowState.index, total - 1);
   const line = shadowState.lines[idx] || { en: '', zh: '' };
   const reflex = isReflex();
+  const pause = isPause();
   shadowState.answered = false;
   $('shadow-step-label').textContent = (idx + 1) + ' / ' + total;
   $('shadow-progress-fill').style.width = (((idx + 1) / total) * 100).toFixed(1) + '%';
   $('shadow-zh').textContent = line.zh || '';
   const en = $('shadow-en');
-  en.textContent = line.en || '';
-  en.classList.toggle('masked', reflex);
+  if (pause) {
+    en.innerHTML = escapeHtml(line.head || '') + ' <span class="pause-gap">……</span>';
+    en.classList.remove('masked');
+  } else {
+    en.textContent = line.en || '';
+    en.classList.toggle('masked', reflex);
+  }
   $('shadow-timer').classList.toggle('hidden', !reflex);
-  $('btn-shadow-reveal').classList.toggle('hidden', !reflex);
+  $('btn-shadow-reveal').classList.toggle('hidden', !(reflex || pause));
+  const hintBtn = $('btn-shadow-hint');
+  if (hintBtn) hintBtn.classList.toggle('hidden', !pause);
   $('shadow-rate-wrap').classList.toggle('hidden', reflex);
   $('btn-shadow-play').classList.toggle('hidden', reflex);
-  $('btn-shadow-mic').textContent = reflex ? '🎤 说出来' : '🎤 跟读';
-  $('btn-shadow-next').textContent = reflex ? '下一题' : '下一句';
+  $('btn-shadow-play').textContent = pause ? '▶ 听前半句' : '▶ 听示范';
+  $('btn-shadow-mic').textContent = reflex ? '🎤 说出来' : (pause ? '🎤 补全' : '🎤 跟读');
+  $('btn-shadow-next').textContent = reflex || pause ? '下一题' : '下一句';
   const score = $('shadow-score-label');
-  score.classList.toggle('hidden', !reflex);
+  score.classList.toggle('hidden', !(reflex || pause));
   score.textContent = shadowState.hits + ' 命中';
-  setShadowFeedback(reflex ? '看中文提示，' + REFLEX_SECONDS + ' 秒内开口说出对应语块。' : '', null);
+  setShadowFeedback(reflex ? '看中文提示，' + REFLEX_SECONDS + ' 秒内开口说出对应语块。' : (pause ? '先点「听前半句」，然后补出后半句或整句。' : ''), null);
   if (reflex) startReflexTimer();
   else stopReflexTimer();
 }
@@ -2138,19 +2438,24 @@ function startShadowing(mode) {
   if (chatEl) chatEl.classList.add('hidden');
   const panel = $('shadow-panel');
   if (panel) panel.classList.remove('hidden');
-  shadowState.mode = mode === 'reflex' ? 'reflex' : 'shadow';
+  shadowState.mode = mode === 'reflex' ? 'reflex' : (mode === 'pause' ? 'pause' : 'shadow');
   shadowState.active = true;
   shadowState.index = 0;
   shadowState.hits = 0;
   shadowState.listening = false;
   const reflex = isReflex();
-  $('shadow-title').textContent = reflex ? '语块反射 · 3 秒' : '跟读 · 会议节奏';
+  const pause = isPause();
+  $('shadow-title').textContent = reflex ? '语块反射 · 3 秒' : (pause ? '半句暂停 · 补全语块' : '跟读 · 会议节奏');
   $('shadow-sub').textContent = reflex
     ? '看中文场景 → 3 秒内说出对应英文语块。练的是「不经思考就调取」，说出语块骨架即算命中。'
-    : '听一句 → 马上跟说（每句 8–12 词）。比的是用词和节奏，不是发音打分。';
+    : (pause
+      ? '先听前半句，暂停后补出后半语块（或整句）。猜对说明搭配已进系统；猜错也有预测误差记忆。'
+      : '听一句 → 马上跟说（每句 8–12 词）。比的是用词和节奏，不是发音打分。');
   shadowState.lines = reflex
     ? buildReflexLines()
-    : (typeof SHADOWING_LINES !== 'undefined' ? SHADOWING_LINES : []).slice();
+    : (pause
+      ? (typeof HALF_PAUSE_LINES !== 'undefined' ? HALF_PAUSE_LINES : []).slice()
+      : (typeof SHADOWING_LINES !== 'undefined' ? SHADOWING_LINES : []).slice());
   if (!shadowState.lines.length) {
     setShadowFeedback('练习内容未加载。', 'bad');
     return;
@@ -2181,6 +2486,12 @@ async function playShadowLine() {
   if (!line) return;
   const rateEl = $('shadow-rate');
   const rate = rateEl ? Number(rateEl.value) : 1;
+  if (isPause()) {
+    setShadowFeedback('听前半句…', null);
+    await speak(line.head || line.en, { rate: rate || 1 });
+    if (shadowState.active) setShadowFeedback('暂停。请补出后半语块（或整句）。', null);
+    return;
+  }
   setShadowFeedback('听示范…', null);
   await speak(line.en, { rate: rate || 1 });
   if (shadowState.active) setShadowFeedback('轮到你了，点「跟读」或直接开麦。', null);
@@ -2206,10 +2517,28 @@ function handleShadowTranscript(spoken, err) {
     return;
   }
   const reflex = isReflex();
-  const target = reflex ? line.stem : line.en;
+  const pause = isPause();
+  const target = reflex ? (line.stem || line.en) : line.en;
   const result = scoreShadow(target, spoken);
   const pct = Math.round(result.score * 100);
-  const pass = result.score >= (reflex ? REFLEX_PASS : SHADOW_PASS);
+  const pass = result.score >= (reflex || pause ? REFLEX_PASS : SHADOW_PASS);
+
+  if (pause) {
+    revealShadowAnswer();
+    if (pass) {
+      if (!shadowState.answered) shadowState.hits += 1;
+      shadowState.answered = true;
+      $('shadow-score-label').textContent = shadowState.hits + ' 命中';
+      setShadowFeedback('补全成功（约 ' + pct + '%）。搭配开始进系统了 → 下一题', 'ok');
+    } else {
+      shadowState.answered = true;
+      const miss = result.missing.length ? '还缺：' + result.missing.join(', ') : '';
+      setShadowFeedback('再猜/再说一遍。命中约 ' + pct + '%。' + miss + ' 完整句：' + line.en, 'bad');
+    }
+    inputEl.value = '';
+    autoResize();
+    return;
+  }
 
   if (reflex) {
     markReflexOpened();
@@ -2241,12 +2570,12 @@ function handleShadowTranscript(spoken, err) {
 
 function finishShadowSet() {
   stopReflexTimer();
-  if (isReflex()) {
+  if (isReflex() || isPause()) {
     const total = shadowState.lines.length;
     const rate = total ? Math.round((shadowState.hits / total) * 100) : 0;
     const verdict = rate >= 80 ? '这组语块基本成条件反射了。' : rate >= 50 ? '一半能调出来，明天再刷一遍。' : '还在「想」而不是「调」，建议先跟读一组再回来。';
     setShadowFeedback('本组完成：' + shadowState.hits + '/' + total + '（' + rate + '%）。' + verdict + ' 点「再来一遍」重刷，或退出去对练。', 'ok');
-    bumpProgress('reflex');
+    bumpProgress(isPause() ? 'shadow' : 'reflex');
   } else {
     setShadowFeedback('本组跟读完成。可以退出去对练，或点「再来一遍」从第一句重练。', 'ok');
     bumpProgress('shadow');
@@ -2380,6 +2709,14 @@ function bindEvents() {
     shadowState.answered = true;
     stopReflexTimer();
     setShadowFeedback('看完答案，照着说一遍再点下一题（本题不计命中）。', null);
+  });
+  const hintShadow = $('btn-shadow-hint');
+  if (hintShadow) hintShadow.addEventListener('click', () => {
+    if (!shadowState.active || !isPause()) return;
+    const line = shadowState.lines[shadowState.index];
+    if (!line) return;
+    setShadowFeedback('开头提示：' + (line.head || '') + ' …', null);
+    speak(line.head || '');
   });
 }
 

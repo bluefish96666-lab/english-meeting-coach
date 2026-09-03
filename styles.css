@@ -405,6 +405,59 @@ html, body {
 .deferred-summary h4 { margin: 0 0 8px; font-size: 13px; color: var(--warn); }
 .deferred-summary .correction { margin-top: 8px; }
 
+.corr-actions {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  margin-top: 10px;
+}
+.corr-actions button {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 4px 9px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.corr-actions button:hover { border-color: var(--accent); }
+.corr-actions .primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.coach-badge {
+  display: inline-block;
+  margin: 0 0 8px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #1e3a5f;
+  color: #9ec5ff;
+  font-size: 11px;
+  font-weight: 700;
+}
+.diagnose-actions {
+  display: flex; flex-wrap: wrap; gap: 8px;
+  margin-top: 12px;
+}
+.mastery-chip {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.mastery-chip.active { color: #b8f0d8; border-color: #2a5a48; background: #123028; }
+.mastery-chip.cued { color: #f6d9a8; border-color: #5a4a20; background: #2a2410; }
+.mastery-chip.need { color: #ffc0c6; border-color: #5a2a32; background: #2a1518; }
+
+.shadow-en .pause-gap {
+  opacity: .35;
+  border-bottom: 2px dotted var(--muted);
+  padding: 0 4px;
+}
+
 /* ===== 输入栏 ===== */
 .input-bar {
   display: flex; align-items: flex-end; gap: 8px;
