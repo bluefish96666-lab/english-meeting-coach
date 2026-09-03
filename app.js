@@ -366,6 +366,12 @@ const DEFAULT_CONFIG = {
   threeSecond: false,
   deferCorrection: false,
   industry: 'none',
+  ttsRate: 0.95,
+  ttsPitch: 1,
+  speakThenListen: true,
+  asrContinuous: true,
+  asrSilenceMs: 1400,
+  asrInterim: true,
 };
 
 const MAX_TOKENS = 800;
@@ -1284,15 +1290,28 @@ async function endReview() {
 
 /* ---------------------------- 语音输出 ------------------------------ */
 let cachedVoice = null;
+
+function scoreVoice(voice) {
+  const name = voice.name || '';
+  const lang = voice.lang || '';
+  let score = 0;
+  if (/^en-US/i.test(lang)) score += 50;
+  else if (/^en-GB/i.test(lang)) score += 35;
+  else if (/^en/i.test(lang)) score += 20;
+  if (/Google|Microsoft|Natural|Neural|Enhanced|Premium/i.test(name)) score += 30;
+  if (/Samantha|Jenny|Aria|Guy|Davis|Brian|Emma|Olivia|Zira|Susan/i.test(name)) score += 18;
+  if (/female|woman/i.test(name)) score += 6;
+  if (/compact|eloquence|novelty|whisper/i.test(name)) score -= 25;
+  if (voice.localService) score += 4;
+  return score;
+}
+
 function pickVoice() {
   const voices = window.speechSynthesis ? speechSynthesis.getVoices() : [];
-  return (
-    voices.find((v) => /en-US/i.test(v.lang) && /female|samantha|zira|google us english/i.test(v.name)) ||
-    voices.find((v) => /en-US/i.test(v.lang)) ||
-    voices.find((v) => /^en/i.test(v.lang)) ||
-    null
-  );
+  if (!voices.length) return null;
+  return [...voices].sort((a, b) => scoreVoice(b) - scoreVoice(a))[0] || null;
 }
+
 if (window.speechSynthesis) {
   speechSynthesis.onvoiceschanged = () => { cachedVoice = pickVoice(); };
   cachedVoice = pickVoice();
@@ -1303,16 +1322,63 @@ let speakingAll = false;
 let ttsGen = 0;
 let ttsWatchdog = null;
 let ttsActive = false;
+let ttsBarrierTimer = null;
 let currentSpeakPromise = null;
+
+function clampRate(rate, fallback) {
+  const n = Number(rate);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.min(1.35, Math.max(0.65, n));
+}
+
+function clampPitch(pitch) {
+  const n = Number(pitch);
+  if (!Number.isFinite(n)) return 1;
+  return Math.min(1.25, Math.max(0.8, n));
+}
+
+function splitForTts(text) {
+  const cleaned = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!cleaned) return [];
+  let parts = cleaned
+    .split(/(?<=[.!?])\s+|(?<=;)\s+|\n+/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+  if (parts.length <= 1 && cleaned.length > 160) {
+    parts = cleaned
+      .split(/(?<=,)\s+|(?<=\s(?:and|but|so|because|which|that)\s)/i)
+      .map((p) => p.trim())
+      .filter(Boolean);
+  }
+  // Merge tiny fragments so TTS doesn't chop every comma.
+  const merged = [];
+  parts.forEach((p) => {
+    const prev = merged[merged.length - 1];
+    if (prev && prev.length + p.length < 56 && (prev.length < 28 || p.length < 16)) {
+      merged[merged.length - 1] = `${prev} ${p}`.trim();
+    } else {
+      merged.push(p);
+    }
+  });
+  return merged.length ? merged : [cleaned];
+}
 
 function makeUtterance(text, opts) {
   const u = new SpeechSynthesisUtterance(text);
-  u.lang = 'en-US';
   const v = cachedVoice || pickVoice();
+  u.lang = (v && v.lang) || 'en-US';
   if (v) u.voice = v;
-  const rate = opts && opts.rate != null ? Number(opts.rate) : 1.0;
-  u.rate = Number.isFinite(rate) && rate > 0 ? rate : 1.0;
+  const baseRate = opts && opts.rate != null ? opts.rate : config.ttsRate;
+  u.rate = clampRate(baseRate, 0.95);
+  u.pitch = clampPitch(opts && opts.pitch != null ? opts.pitch : config.ttsPitch);
   return u;
+}
+
+function clearTtsBarrier() {
+  if (ttsBarrierTimer) {
+    clearTimeout(ttsBarrierTimer);
+    ttsBarrierTimer = null;
+  }
 }
 
 function stopTtsWatchdog() {
@@ -1327,11 +1393,13 @@ function startTtsWatchdog() {
   // Chrome 连续 TTS 可能卡住，定时 resume
   ttsWatchdog = setInterval(() => {
     if (!window.speechSynthesis) return;
-    if (speechSynthesis.speaking) {
-      speechSynthesis.pause();
-      speechSynthesis.resume();
+    if (speechSynthesis.speaking && !speechSynthesis.paused) {
+      try {
+        speechSynthesis.pause();
+        speechSynthesis.resume();
+      } catch (e) { /* ignore */ }
     }
-  }, 8000);
+  }, 9000);
 }
 
 function updateSpeakAllBtn() {
@@ -1348,12 +1416,13 @@ function stopSpeakAll() {
   ttsActive = false;
   speakQueue = [];
   speakingAll = false;
+  clearTtsBarrier();
   stopTtsWatchdog();
   try { if (window.speechSynthesis) speechSynthesis.cancel(); } catch (e) { /* ignore */ }
   updateSpeakAllBtn();
 }
 
-function drainSpeakQueue(gen) {
+function drainSpeakQueue(gen, opts) {
   if (gen !== ttsGen) return;
   if (!speakQueue.length) {
     speakingAll = false;
@@ -1363,12 +1432,13 @@ function drainSpeakQueue(gen) {
   }
   const text = speakQueue.shift();
   try {
-    const u = makeUtterance(text);
-    u.onend = () => { if (gen === ttsGen) setTimeout(() => drainSpeakQueue(gen), 280); };
-    u.onerror = () => { if (gen === ttsGen) setTimeout(() => drainSpeakQueue(gen), 280); };
+    const u = makeUtterance(text, opts);
+    const gap = speakQueue.length ? 220 : 80;
+    u.onend = () => { if (gen === ttsGen) setTimeout(() => drainSpeakQueue(gen, opts), gap); };
+    u.onerror = () => { if (gen === ttsGen) setTimeout(() => drainSpeakQueue(gen, opts), gap); };
     speechSynthesis.speak(u);
   } catch (e) {
-    if (gen === ttsGen) setTimeout(() => drainSpeakQueue(gen), 280);
+    if (gen === ttsGen) setTimeout(() => drainSpeakQueue(gen, opts), 220);
   }
 }
 
@@ -1388,8 +1458,7 @@ function speakAllPhrases() {
   updateSpeakAllBtn();
   startTtsWatchdog();
   try { speechSynthesis.cancel(); } catch (e) { /* ignore */ }
-  // cancel 在部分浏览器是异步的，稍后再排队
-  setTimeout(() => drainSpeakQueue(gen), 80);
+  setTimeout(() => drainSpeakQueue(gen, { rate: config.ttsRate }), 80);
 }
 
 function stopTTS() {
@@ -1397,6 +1466,7 @@ function stopTTS() {
   ttsActive = false;
   speakQueue = [];
   speakingAll = false;
+  clearTtsBarrier();
   stopTtsWatchdog();
   updateSpeakAllBtn();
   try { if (window.speechSynthesis) speechSynthesis.cancel(); } catch (e) { /* ignore */ }
@@ -1420,6 +1490,7 @@ function speak(text, opts) {
       if (settled) return;
       settled = true;
       if (safety) clearTimeout(safety);
+      clearTtsBarrier();
       if (gen === ttsGen) ttsActive = false;
       resolve();
     };
@@ -1430,21 +1501,55 @@ function speak(text, opts) {
     ttsGen += 1;
     gen = ttsGen;
     ttsActive = true;
-    speakQueue = [];
     speakingAll = false;
+    clearTtsBarrier();
     stopTtsWatchdog();
     updateSpeakAllBtn();
-    safety = setTimeout(finish, Math.min(60000, 2500 + String(text).length * 70));
+    const chunks = splitForTts(text);
+    speakQueue = chunks.slice();
+    const est = chunks.reduce((n, c) => n + c.length, 0);
+    safety = setTimeout(finish, Math.min(90000, 2800 + est * 75 + chunks.length * 300));
+    startTtsWatchdog();
     try {
       speechSynthesis.cancel();
       setTimeout(() => {
         if (gen !== ttsGen) { finish(); return; }
-        try {
-          const u = makeUtterance(text, opts);
-          u.onend = finish;
-          u.onerror = finish;
-          speechSynthesis.speak(u);
-        } catch (e) { finish(); }
+        const drain = () => {
+          if (gen !== ttsGen) { finish(); return; }
+          if (!speakQueue.length) {
+            // End barrier: synthesis often reports end a beat early; give ASR a clean gap.
+            const barrier = config.speakThenListen === false ? 90 : 240;
+            clearTtsBarrier();
+            ttsBarrierTimer = setTimeout(() => {
+              ttsBarrierTimer = null;
+              finish();
+            }, barrier);
+            return;
+          }
+          const next = speakQueue.shift();
+          try {
+            const u = makeUtterance(next, opts);
+            const gap = speakQueue.length ? 180 : 0;
+            u.onend = () => {
+              if (gen !== ttsGen) { finish(); return; }
+              if (gap) setTimeout(drain, gap);
+              else drain();
+            };
+            u.onerror = () => {
+              if (gen !== ttsGen) { finish(); return; }
+              setTimeout(drain, 120);
+            };
+            speechSynthesis.speak(u);
+            setTimeout(() => {
+              try {
+                if (speechSynthesis.paused) speechSynthesis.resume();
+              } catch (e) { /* ignore */ }
+            }, 40);
+          } catch (e) {
+            setTimeout(drain, 120);
+          }
+        };
+        drain();
       }, 60);
     } catch (e) { finish(); }
   });
@@ -1489,9 +1594,15 @@ function cancelHandsfreeListen() {
 function pauseHandsfree() {
   speakListenId += 1;
   cancelHandsfreeListen();
+  clearAsrSilence();
   if (isRecording && recognition) {
     try { recognition.stop(); } catch (e) { /* ignore */ }
   }
+}
+
+function handsfreeGapMs() {
+  if (config.speakThenListen === false) return 120;
+  return 420;
 }
 
 function scheduleHandsfreeListen() {
@@ -1500,8 +1611,12 @@ function scheduleHandsfreeListen() {
   handsfreeTimer = setTimeout(() => {
     handsfreeTimer = null;
     if (!config.handsfree || turnBusy || isRecording) return;
+    if (config.speakThenListen !== false && isTtsPlaying()) {
+      waitForTtsThenListen();
+      return;
+    }
     startMic('handsfree');
-  }, 450);
+  }, handsfreeGapMs());
 }
 
 async function speakThenMaybeListen(text) {
@@ -1600,67 +1715,186 @@ function updateMicStatus() {
 /* ---------------------------- 语音输入 ------------------------------ */
 let recognition = null;
 let isRecording = false;
+let asrFinalParts = [];
+let asrInterimText = '';
+let asrSilenceTimer = null;
+let asrSessionId = 0;
+let asrHandled = false;
+let asrHadSpeech = false;
+
+function clearAsrSilence() {
+  if (asrSilenceTimer) {
+    clearTimeout(asrSilenceTimer);
+    asrSilenceTimer = null;
+  }
+}
+
+function cleanupTranscript(text) {
+  return String(text || '')
+    .replace(/[\u0000-\u001F]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/\s+([,.!?;:])/g, '$1')
+    .replace(/([({\[])\s+/g, '$1')
+    .replace(/\s+([)}\]])/g, '$1')
+    .replace(/\b(\w+)\s+\1\b/gi, '$1')
+    .trim();
+}
+
+function currentAsrText() {
+  const finals = asrFinalParts.join(' ').trim();
+  const interim = asrInterimText.trim();
+  return cleanupTranscript([finals, interim].filter(Boolean).join(' '));
+}
+
+function syncAsrInput() {
+  if (!inputEl) return;
+  inputEl.value = currentAsrText();
+  autoResize();
+}
+
+function asrSilenceMs() {
+  const n = Number(config.asrSilenceMs);
+  let base = Number.isFinite(n) ? n : 1400;
+  base = Math.min(3200, Math.max(700, base));
+  // 跟读 / 重说通常更短，收尾更快。
+  if (micSource === 'shadow' || micSource === 'resay') return Math.min(base, 1100);
+  return base;
+}
+
+function armAsrSilence(session) {
+  clearAsrSilence();
+  if (!config.asrContinuous) return;
+  asrSilenceTimer = setTimeout(() => {
+    asrSilenceTimer = null;
+    if (session !== asrSessionId || !isRecording || !recognition) return;
+    try { recognition.stop(); } catch (e) { /* ignore */ }
+  }, asrSilenceMs());
+}
+
+function resetAsrBuffer() {
+  asrFinalParts = [];
+  asrInterimText = '';
+  asrHadSpeech = false;
+  asrHandled = false;
+  clearAsrSilence();
+}
+
+function finishAsrTurn(spoken, err) {
+  if (asrHandled) return;
+  asrHandled = true;
+  clearAsrSilence();
+  const text = cleanupTranscript(spoken);
+  if (inputEl && text) {
+    inputEl.value = text;
+    autoResize();
+  }
+
+  if (err === 'aborted' || err === 'not-allowed') {
+    shadowState.listening = false;
+    return;
+  }
+  if (shadowState.active && micSource === 'shadow') {
+    shadowState.listening = false;
+    handleShadowTranscript(text, err);
+    return;
+  }
+  if (micSource === 'resay') {
+    handleResayTranscript(text || '');
+    return;
+  }
+  if (text) {
+    noSpeechRetries = 0;
+    if (!turnBusy) handleUserTurn();
+    return;
+  }
+  if (config.handsfree && micSource === 'handsfree') {
+    if (noSpeechRetries < 1) {
+      noSpeechRetries += 1;
+      addMessage('system', '没听清，再说一次…', null, null);
+      scheduleHandsfreeListen();
+    } else {
+      noSpeechRetries = 0;
+      addMessage('system', '免提：没听到说话，已暂停监听。点 🎤 继续。', null, null);
+      updateMicStatus();
+    }
+  }
+}
+
 function setupRecognition() {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SR) return null;
   const r = new SR();
   r.lang = 'en-US';
-  r.interimResults = true;
-  r.continuous = false;
+  r.interimResults = config.asrInterim !== false;
+  r.continuous = !!config.asrContinuous;
+  r.maxAlternatives = 3;
+
   r.onspeechstart = () => {
+    asrHadSpeech = true;
     if (shadowState.active && shadowState.mode === 'reflex') markReflexOpened();
+    // Barge-in: user started talking while TTS might still be draining.
+    if (config.speakThenListen === false && isTtsPlaying()) stopTTS();
   };
+
   r.onresult = (e) => {
-    let final = '';
+    const session = asrSessionId;
+    let bestFinal = '';
+    let bestConf = -1;
     let interim = '';
     for (let i = e.resultIndex; i < e.results.length; i++) {
-      const t = e.results[i][0].transcript;
-      if (e.results[i].isFinal) final += t;
-      else interim += t;
+      const result = e.results[i];
+      const top = result[0];
+      if (!top) continue;
+      if (result.isFinal) {
+        // Prefer higher-confidence alternative when browser provides it.
+        let pick = top;
+        for (let a = 0; a < result.length; a++) {
+          const alt = result[a];
+          const conf = typeof alt.confidence === 'number' ? alt.confidence : 0;
+          if (!pick || conf > (typeof pick.confidence === 'number' ? pick.confidence : -1)) pick = alt;
+        }
+        const conf = typeof pick.confidence === 'number' ? pick.confidence : 0.5;
+        // Drop extremely low-confidence finals that are often echo/noise.
+        if (conf < 0.18 && String(pick.transcript || '').trim().split(/\s+/).length <= 2) continue;
+        asrFinalParts.push(String(pick.transcript || ''));
+        if (conf > bestConf) {
+          bestConf = conf;
+          bestFinal = String(pick.transcript || '');
+        }
+        asrInterimText = '';
+        asrHadSpeech = true;
+      } else {
+        interim += String(top.transcript || '');
+      }
     }
-    inputEl.value = (final + ' ' + interim).trim();
-    autoResize();
+    if (interim) {
+      asrInterimText = interim;
+      asrHadSpeech = true;
+    }
+    syncAsrInput();
+    if (session === asrSessionId && (bestFinal || interim)) armAsrSilence(session);
   };
+
   r.onend = () => {
+    const spoken = currentAsrText();
     isRecording = false;
     $('btn-mic').classList.remove('recording');
     updateMicStatus();
     const err = lastRecError;
     lastRecError = '';
-    const spoken = inputEl.value.trim();
-    if (err === 'aborted' || err === 'not-allowed') {
-      shadowState.listening = false;
-      return;
-    }
-    if (shadowState.active && micSource === 'shadow') {
-      shadowState.listening = false;
-      handleShadowTranscript(spoken, err);
-      return;
-    }
-    if (micSource === 'resay') {
-      handleResayTranscript(spoken || '');
-      return;
-    }
-    if (spoken) {
-      noSpeechRetries = 0;
-      if (!turnBusy) handleUserTurn();
-      return;
-    }
-    if (config.handsfree && micSource === 'handsfree') {
-      if (noSpeechRetries < 1) {
-        noSpeechRetries += 1;
-        addMessage('system', '没听清，再说一次…', null, null);
-        scheduleHandsfreeListen();
-      } else {
-        noSpeechRetries = 0;
-        addMessage('system', '免提：没听到说话，已暂停监听。点 🎤 继续。', null, null);
-        updateMicStatus();
-      }
-    }
+    finishAsrTurn(spoken, err);
   };
+
   r.onerror = (e) => {
     lastRecError = e.error || '';
+    if (e.error === 'no-speech' && config.asrContinuous && asrHadSpeech && currentAsrText()) {
+      // Treat trailing silence as end-of-utterance, not a hard failure.
+      lastRecError = '';
+      try { r.stop(); } catch (err) { /* ignore */ }
+      return;
+    }
     isRecording = false;
+    clearAsrSilence();
     $('btn-mic').classList.remove('recording');
     updateMicStatus();
     if (e.error === 'not-allowed') {
@@ -1670,6 +1904,17 @@ function setupRecognition() {
     }
   };
   return r;
+}
+
+function invalidateRecognition() {
+  clearAsrSilence();
+  if (isRecording && recognition) {
+    try { recognition.stop(); } catch (e) { /* ignore */ }
+  }
+  recognition = null;
+  isRecording = false;
+  const btn = $('btn-mic');
+  if (btn) btn.classList.remove('recording');
 }
 
 function startMic(source) {
@@ -1690,17 +1935,33 @@ function startMic(source) {
   if (source !== 'shadow') markChallengeOpened();
   speakListenId += 1;
   cancelHandsfreeListen();
+
+  // 说完再听：免提不打断 TTS；手动点麦仍可抢麦。
+  if (source === 'handsfree' && config.speakThenListen !== false && isTtsPlaying()) {
+    waitForTtsThenListen();
+    return;
+  }
   stopTTS();
   if (!recognition) recognition = setupRecognition();
   if (isRecording) return;
   micSource = source || 'manual';
+  asrSessionId += 1;
+  resetAsrBuffer();
   isRecording = true;
   $('btn-mic').classList.add('recording');
   updateMicStatus();
-  try { recognition.start(); } catch (e) {
-    isRecording = false;
-    $('btn-mic').classList.remove('recording');
-    updateMicStatus();
+  try {
+    recognition.start();
+  } catch (e) {
+    // Restart once if previous instance was mid-cycle.
+    try {
+      recognition = setupRecognition();
+      recognition.start();
+    } catch (err) {
+      isRecording = false;
+      $('btn-mic').classList.remove('recording');
+      updateMicStatus();
+    }
   }
 }
 
@@ -1708,6 +1969,7 @@ function toggleMic() {
   if (isRecording) {
     speakListenId += 1;
     cancelHandsfreeListen();
+    clearAsrSilence();
     recognition && recognition.stop();
     return;
   }
@@ -1931,12 +2193,22 @@ function openSettings() {
   if ($('cfg-threesecond')) $('cfg-threesecond').checked = !!config.threeSecond;
   if ($('cfg-defer')) $('cfg-defer').checked = !!config.deferCorrection;
   if ($('cfg-industry')) $('cfg-industry').value = config.industry || 'none';
+  if ($('cfg-tts-rate')) $('cfg-tts-rate').value = clampRate(config.ttsRate, 0.95);
+  if ($('cfg-speak-then-listen')) $('cfg-speak-then-listen').checked = config.speakThenListen !== false;
+  if ($('cfg-asr-continuous')) $('cfg-asr-continuous').checked = config.asrContinuous !== false;
+  if ($('cfg-asr-silence')) $('cfg-asr-silence').value = asrSilenceMs();
+  if ($('cfg-asr-interim')) $('cfg-asr-interim').checked = config.asrInterim !== false;
   $('settings-overlay').classList.remove('hidden');
 }
 function closeSettings() { $('settings-overlay').classList.add('hidden'); }
 
 function saveSettings() {
   const prevHandsfree = !!config.handsfree;
+  const prevAsr = {
+    continuous: !!config.asrContinuous,
+    interim: config.asrInterim !== false,
+    silence: asrSilenceMs(),
+  };
   config.base = $('cfg-base').value.trim();
   config.key = $('cfg-key').value.trim();
   config.model = $('cfg-model').value.trim();
@@ -1948,8 +2220,18 @@ function saveSettings() {
   config.threeSecond = $('cfg-threesecond') ? $('cfg-threesecond').checked : false;
   config.deferCorrection = $('cfg-defer') ? $('cfg-defer').checked : false;
   config.industry = $('cfg-industry') ? ($('cfg-industry').value || 'none') : 'none';
+  config.ttsRate = $('cfg-tts-rate') ? clampRate($('cfg-tts-rate').value, 0.95) : clampRate(config.ttsRate, 0.95);
+  config.speakThenListen = $('cfg-speak-then-listen') ? $('cfg-speak-then-listen').checked : true;
+  config.asrContinuous = $('cfg-asr-continuous') ? $('cfg-asr-continuous').checked : true;
+  config.asrSilenceMs = $('cfg-asr-silence') ? Number($('cfg-asr-silence').value) : 1400;
+  config.asrInterim = $('cfg-asr-interim') ? $('cfg-asr-interim').checked : true;
   persistOrWarn('dave_config', config);
   closeSettings();
+  const asrChanged =
+    prevAsr.continuous !== !!config.asrContinuous ||
+    prevAsr.interim !== (config.asrInterim !== false) ||
+    prevAsr.silence !== asrSilenceMs();
+  if (asrChanged) invalidateRecognition();
   updateMicStatus();
   renderTemplates();
   addMessage('system', '✅ 设置已保存（Key 仅存本机浏览器）。', null, null);
@@ -1975,6 +2257,11 @@ function readSettingsForm() {
     threeSecond: $('cfg-threesecond') ? $('cfg-threesecond').checked : config.threeSecond,
     deferCorrection: $('cfg-defer') ? $('cfg-defer').checked : config.deferCorrection,
     industry: $('cfg-industry') ? ($('cfg-industry').value || 'none') : config.industry,
+    ttsRate: $('cfg-tts-rate') ? clampRate($('cfg-tts-rate').value, 0.95) : clampRate(config.ttsRate, 0.95),
+    speakThenListen: $('cfg-speak-then-listen') ? $('cfg-speak-then-listen').checked : config.speakThenListen !== false,
+    asrContinuous: $('cfg-asr-continuous') ? $('cfg-asr-continuous').checked : config.asrContinuous !== false,
+    asrSilenceMs: $('cfg-asr-silence') ? Number($('cfg-asr-silence').value) : config.asrSilenceMs,
+    asrInterim: $('cfg-asr-interim') ? $('cfg-asr-interim').checked : config.asrInterim !== false,
   };
 }
 

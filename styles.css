@@ -613,6 +613,16 @@ html, body {
 .field select:focus { outline: none; border-color: var(--accent); }
 
 .modal-note { font-size: 12px; color: var(--muted); margin: 4px 0 14px; }
+.modal-section {
+  margin: 16px 0 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--muted);
+  text-transform: none;
+}
 .modal-foot { display: flex; justify-content: flex-end; gap: 8px; }
 
 /* 滚动条 */
