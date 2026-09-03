@@ -309,6 +309,19 @@ function buildSystemPrompt(persona, scenarioName, scenarioDesc) {
     persona.promptBody,
     '',
     'Current scenario: ' + scenarioName + ' (' + scenarioDesc + ').',
+    ...(function () {
+      const lesson = session && session.lessonId ? getLessonById(session.lessonId) : (lessonState.active ? getActiveLesson() : null);
+      if (!lesson) return [];
+      const goals = (lesson.goals || []).slice(0, 4).map((g, i) => (i + 1) + ') ' + g);
+      const chunks = (lesson.chunks || []).slice(0, 4).map((c) => '- ' + (c.example || c.en || ''));
+      return [
+        '',
+        'Lesson goals for this meeting drill (nudge the user to practice these, without teaching in reply):',
+        ...goals,
+        'Target chunks to elicit when natural:',
+        ...chunks,
+      ];
+    })(),
     ...industryBlock,
     '',
     'Rules:',
@@ -428,6 +441,7 @@ function loadProgress() {
       shadow: !!raw.shadow,
       reflex: !!raw.reflex,
       coach: !!raw.coach,
+      lesson: !!raw.lesson,
       turns: Number(raw.turns) || 0,
       review: !!raw.review,
       streak: Number(raw.streak) || 0,
@@ -438,10 +452,110 @@ function loadProgress() {
   yesterday.setDate(yesterday.getDate() - 1);
   const yKey = yesterday.getFullYear() + '-' + String(yesterday.getMonth() + 1).padStart(2, '0') + '-' + String(yesterday.getDate()).padStart(2, '0');
   const streak = raw && raw.date === yKey && raw.review ? (Number(raw.streak) || 0) : 0;
-  return { date: today, shadow: false, reflex: false, coach: false, turns: 0, review: false, streak };
+  return { date: today, shadow: false, reflex: false, coach: false, lesson: false, turns: 0, review: false, streak };
 }
 let progress = loadProgress();
 const PLAN_TURNS_GOAL = 5;
+
+/* ------------------------- 弱项自动收集（本机） ---------------------- */
+const WEAK_KEY = 'dave_weak_spots';
+function loadWeakSpots() {
+  const raw = store.get(WEAK_KEY, []);
+  if (!Array.isArray(raw)) return [];
+  return raw.map((w) => {
+    if (!w || typeof w !== 'object') return null;
+    const en = String(w.en || '').trim();
+    if (!en) return null;
+    return {
+      en,
+      zh: String(w.zh || ''),
+      cue: String(w.cue || ''),
+      source: String(w.source || ''),
+      fails: Math.max(1, Number(w.fails) || 1),
+      resolved: !!w.resolved,
+      updatedAt: Number(w.updatedAt) || Date.now(),
+    };
+  }).filter(Boolean);
+}
+let weakSpots = loadWeakSpots();
+
+function persistWeakSpots() {
+  persistOrWarn(WEAK_KEY, weakSpots.slice(0, 80));
+}
+
+function upsertWeakSpot(en, meta) {
+  const textEn = String(en || '').trim();
+  if (!textEn || textEn.length < 4) return;
+  const info = meta || {};
+  const existing = weakSpots.find((w) => w.en.toLowerCase() === textEn.toLowerCase());
+  if (existing) {
+    existing.fails = (existing.fails || 1) + 1;
+    existing.resolved = false;
+    existing.updatedAt = Date.now();
+    if (info.zh) existing.zh = info.zh;
+    if (info.cue) existing.cue = info.cue;
+    if (info.source) existing.source = info.source;
+  } else {
+    weakSpots.unshift({
+      en: textEn,
+      zh: info.zh || '',
+      cue: info.cue || '',
+      source: info.source || '',
+      fails: 1,
+      resolved: false,
+      updatedAt: Date.now(),
+    });
+  }
+  weakSpots = weakSpots.slice(0, 80);
+  persistWeakSpots();
+}
+
+function resolveWeakSpot(en) {
+  const textEn = String(en || '').trim().toLowerCase();
+  if (!textEn) return;
+  const existing = weakSpots.find((w) => w.en.toLowerCase() === textEn);
+  if (!existing) return;
+  existing.fails = Math.max(0, (existing.fails || 1) - 1);
+  if (existing.fails <= 0) existing.resolved = true;
+  existing.updatedAt = Date.now();
+  persistWeakSpots();
+}
+
+function getOpenWeakSpots(limit) {
+  const n = Number(limit) || 6;
+  return weakSpots
+    .filter((w) => !w.resolved && w.fails > 0)
+    .sort((a, b) => (b.fails - a.fails) || (b.updatedAt - a.updatedAt))
+    .slice(0, n);
+}
+
+/* ------------------------- 会议课卡状态 ---------------------------- */
+const LESSON_STEPS = [
+  { id: 'goals', label: 'Goals' },
+  { id: 'warmup', label: 'Warm-up' },
+  { id: 'dialogue', label: 'Dialogue' },
+  { id: 'practice', label: 'Practice' },
+  { id: 'roleplay', label: 'Roleplay' },
+  { id: 'discussion', label: 'Discussion' },
+  { id: 'further', label: 'Further' },
+];
+const lessonState = {
+  active: false,
+  lessonId: '',
+  stepIndex: 0,
+  returnAfterShadow: false,
+  filterIndustry: 'all',
+  filterLevel: 'all',
+};
+
+function getLessonById(id) {
+  const list = typeof MEETING_LESSONS !== 'undefined' ? MEETING_LESSONS : [];
+  return list.find((l) => l.id === id) || null;
+}
+
+function getActiveLesson() {
+  return getLessonById(lessonState.lessonId);
+}
 
 function bumpProgress(key, value) {
   if (progress.date !== todayKey()) progress = loadProgress();
@@ -559,13 +673,15 @@ function renderWelcome() {
   welcomeEl.innerHTML =
     '<p class="welcome-title">Pick a lane. Say a number.</p>' +
     '<div class="welcome-actions">' +
+    '<button type="button" class="btn btn-primary" id="btn-start-lesson">会议课 · 情景课卡</button>' +
     '<button type="button" class="btn btn-primary" id="btn-start-shadow">跟读 · 会议节奏</button>' +
     '<button type="button" class="btn btn-primary" id="btn-start-reflex">语块反射 · 3 秒</button>' +
     '<button type="button" class="btn btn-primary" id="btn-start-pause">半句暂停</button>' +
     '<button type="button" class="btn btn-primary" id="btn-start-coach">语块教练 · 15 分钟</button>' +
     '</div>' +
     '<div class="today-plan" id="today-plan"></div>' +
-    '<p class="welcome-note">按文章闭环：听见/跟读 → 反射提取 →（可选）语块教练 → 对练 5 轮 → 复盘诊断。设置可开 3 秒开口 / 严格纠错 / 先流畅后纠错。</p>' +
+    '<div class="materials-browser" id="materials-browser"></div>' +
+    '<p class="welcome-note">课卡闭环：Goals → Warm-up → Dialogue → Practice → Roleplay → Discussion / Further。弱项会自动进今日优先。</p>' +
     '<ul class="welcome-list"></ul>';
   const list = welcomeEl.querySelector('.welcome-list');
   currentPersona.scenarios.forEach((s, i) => {
@@ -573,6 +689,11 @@ function renderWelcome() {
     li.innerHTML = `<strong>${i + 1}.</strong> ${escapeHtml(s.name)} <span style="color:var(--muted);font-size:12px">— ${escapeHtml(s.desc)}</span>`;
     li.addEventListener('click', () => startSession(s.id));
     list.appendChild(li);
+  });
+  const lessonBtn = welcomeEl.querySelector('#btn-start-lesson');
+  if (lessonBtn) lessonBtn.addEventListener('click', () => {
+    const lessons = typeof MEETING_LESSONS !== 'undefined' ? MEETING_LESSONS : [];
+    if (lessons[0]) startLesson(lessons[0].id);
   });
   const shadowBtn = welcomeEl.querySelector('#btn-start-shadow');
   if (shadowBtn) shadowBtn.addEventListener('click', () => startShadowing('shadow'));
@@ -583,6 +704,7 @@ function renderWelcome() {
   const coachBtn = welcomeEl.querySelector('#btn-start-coach');
   if (coachBtn) coachBtn.addEventListener('click', startCoachSession);
   renderTodayPlan();
+  renderMaterialsBrowser();
 }
 
 function renderTodayPlan() {
@@ -590,8 +712,12 @@ function renderTodayPlan() {
   if (!el) return;
   if (progress.date !== todayKey()) progress = loadProgress();
   const steps = [
+    { key: 'lesson', label: '会议课 1 节', done: progress.lesson, sub: '情景课卡', act: () => {
+      const lessons = typeof MEETING_LESSONS !== 'undefined' ? MEETING_LESSONS : [];
+      if (lessons[0]) startLesson(lessons[0].id);
+    } },
     { key: 'shadow', label: '跟读 1 组', done: progress.shadow, sub: '约 1 分钟', act: () => startShadowing('shadow') },
-    { key: 'reflex', label: '语块反射', done: progress.reflex, sub: '10 题', act: () => startShadowing('reflex') },
+    { key: 'reflex', label: '语块反射', done: progress.reflex, sub: '弱项优先', act: () => startShadowing('reflex') },
     { key: 'coach', label: '语块教练', done: progress.coach, sub: '15 分钟 / 3 块', act: () => startCoachSession() },
     { key: 'turns', label: '对练 ' + PLAN_TURNS_GOAL + ' 轮', done: progress.turns >= PLAN_TURNS_GOAL, sub: progress.turns + '/' + PLAN_TURNS_GOAL, act: () => startSession(scenarioSelect.value || currentPersona.scenarios[0].id) },
     { key: 'review', label: '复盘诊断', done: progress.review, sub: '提炼缺失语块', act: () => { if (session) endReview(); else startSession(scenarioSelect.value || currentPersona.scenarios[0].id); } },
@@ -600,7 +726,7 @@ function renderTodayPlan() {
   el.innerHTML = '';
   const head = document.createElement('div');
   head.className = 'today-plan-head';
-  head.innerHTML = '<strong>今日训练 ' + doneCount + '/5</strong><span>连续 ' + (progress.streak || 0) + ' 天 · 听见→提取→对练→回收</span>';
+  head.innerHTML = '<strong>今日训练 ' + doneCount + '/' + steps.length + '</strong><span>连续 ' + (progress.streak || 0) + ' 天 · 课卡→提取→对练→回收</span>';
   el.appendChild(head);
   const row = document.createElement('div');
   row.className = 'today-steps';
@@ -613,7 +739,445 @@ function renderTodayPlan() {
     row.appendChild(b);
   });
   el.appendChild(row);
+  renderWeakStrip(el);
 }
+
+function renderWeakStrip(parent) {
+  const open = getOpenWeakSpots(4);
+  if (!open.length || !parent) return;
+  const strip = document.createElement('div');
+  strip.className = 'weak-strip';
+  strip.innerHTML = '<strong>弱项优先 · ' + open.length + ' 条待练</strong>';
+  const ul = document.createElement('ul');
+  open.forEach((w) => {
+    const li = document.createElement('li');
+    li.textContent = w.en + (w.source ? ' · ' + w.source : '') + ' ×' + w.fails;
+    ul.appendChild(li);
+  });
+  strip.appendChild(ul);
+  const actions = document.createElement('div');
+  actions.className = 'weak-actions';
+  const drill = document.createElement('button');
+  drill.type = 'button';
+  drill.className = 'btn btn-primary';
+  drill.textContent = '用弱项做反射';
+  drill.addEventListener('click', startWeakReflex);
+  const clear = document.createElement('button');
+  clear.type = 'button';
+  clear.className = 'btn btn-ghost';
+  clear.textContent = '清理已解决';
+  clear.addEventListener('click', () => {
+    weakSpots = weakSpots.filter((w) => !w.resolved);
+    persistWeakSpots();
+    renderWelcome();
+  });
+  actions.appendChild(drill);
+  actions.appendChild(clear);
+  strip.appendChild(actions);
+  parent.appendChild(strip);
+}
+
+function industryLabel(id) {
+  const packs = typeof INDUSTRY_PACKS !== 'undefined' ? INDUSTRY_PACKS : {};
+  if (packs[id] && packs[id].label) return packs[id].label;
+  return id || '通用';
+}
+
+function filteredLessons() {
+  const list = typeof MEETING_LESSONS !== 'undefined' ? MEETING_LESSONS : [];
+  return list.filter((l) => {
+    if (lessonState.filterIndustry !== 'all' && l.industry !== lessonState.filterIndustry) return false;
+    if (lessonState.filterLevel !== 'all' && l.level !== lessonState.filterLevel) return false;
+    return true;
+  });
+}
+
+function renderMaterialsBrowser() {
+  const el = $('materials-browser');
+  if (!el) return;
+  const lessons = typeof MEETING_LESSONS !== 'undefined' ? MEETING_LESSONS : [];
+  const industries = Array.from(new Set(lessons.map((l) => l.industry).filter(Boolean)));
+  const levels = Array.from(new Set(lessons.map((l) => l.level).filter(Boolean)));
+  el.innerHTML = '';
+  const head = document.createElement('div');
+  head.className = 'materials-head';
+  head.innerHTML = '<strong>教材浏览 · 会议课卡</strong><span>' + filteredLessons().length + ' / ' + lessons.length + '</span>';
+  el.appendChild(head);
+  const filters = document.createElement('div');
+  filters.className = 'materials-filters';
+  const ind = document.createElement('select');
+  ind.innerHTML = '<option value="all">行业：全部</option>' +
+    industries.map((id) => '<option value="' + escapeHtml(id) + '">' + escapeHtml(industryLabel(id)) + '</option>').join('');
+  ind.value = lessonState.filterIndustry;
+  ind.addEventListener('change', () => {
+    lessonState.filterIndustry = ind.value;
+    renderMaterialsBrowser();
+  });
+  const lvl = document.createElement('select');
+  lvl.innerHTML = '<option value="all">难度：全部</option>' +
+    levels.map((lv) => '<option value="' + escapeHtml(lv) + '">' + escapeHtml(lv) + '</option>').join('');
+  lvl.value = lessonState.filterLevel;
+  lvl.addEventListener('change', () => {
+    lessonState.filterLevel = lvl.value;
+    renderMaterialsBrowser();
+  });
+  filters.appendChild(ind);
+  filters.appendChild(lvl);
+  el.appendChild(filters);
+  const list = document.createElement('div');
+  list.className = 'materials-list';
+  const shown = filteredLessons();
+  shown.forEach((lesson) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'material-card';
+    btn.innerHTML =
+      '<span class="title">' + escapeHtml(lesson.title) + '</span>' +
+      '<span class="meta">' + escapeHtml(industryLabel(lesson.industry)) + ' · ' + escapeHtml(lesson.level || '') +
+      ' · ' + ((lesson.goals || []).length) + ' goals</span>';
+    btn.addEventListener('click', () => startLesson(lesson.id));
+    list.appendChild(btn);
+  });
+  if (!shown.length) {
+    const empty = document.createElement('p');
+    empty.className = 'welcome-note';
+    empty.textContent = '没有匹配的课卡，换个筛选试试。';
+    list.appendChild(empty);
+  }
+  el.appendChild(list);
+}
+
+function hideLessonChrome() {
+  const panel = $('lesson-panel');
+  if (panel) panel.classList.add('hidden');
+  const rail = $('lesson-rail');
+  if (rail) rail.classList.add('hidden');
+}
+
+function showLessonRail(label) {
+  const rail = $('lesson-rail');
+  if (!rail) return;
+  rail.classList.remove('hidden');
+  const lab = $('lesson-rail-label');
+  if (lab) lab.textContent = label || '会议课进行中';
+}
+
+function startLesson(lessonId) {
+  const lesson = getLessonById(lessonId);
+  if (!lesson) {
+    addMessage('system', '课卡未找到。', null, null);
+    return;
+  }
+  exitShadowing({ silent: true });
+  clearChallenge();
+  pauseHandsfree();
+  session = null;
+  lessonState.active = true;
+  lessonState.lessonId = lesson.id;
+  lessonState.stepIndex = 0;
+  lessonState.returnAfterShadow = false;
+  resetChatView(false);
+  welcomeEl.classList.add('hidden');
+  if (chatEl) chatEl.classList.add('hidden');
+  const panel = $('lesson-panel');
+  if (panel) panel.classList.remove('hidden');
+  const rail = $('lesson-rail');
+  if (rail) rail.classList.add('hidden');
+  $('lesson-title').textContent = lesson.title;
+  $('lesson-sub').textContent = industryLabel(lesson.industry) + ' · ' + (lesson.level || '') + ' · Goals → Further';
+  renderLesson();
+}
+
+function exitLesson(opts) {
+  const was = lessonState.active;
+  lessonState.active = false;
+  lessonState.returnAfterShadow = false;
+  lessonState.stepIndex = 0;
+  hideLessonChrome();
+  if (chatEl) chatEl.classList.remove('hidden');
+  if (was && !(opts && opts.silent)) resetToWelcome();
+}
+
+function renderLessonSteps() {
+  const el = $('lesson-steps');
+  if (!el) return;
+  el.innerHTML = '';
+  LESSON_STEPS.forEach((step, idx) => {
+    const pill = document.createElement('span');
+    pill.className = 'lesson-step-pill' + (idx === lessonState.stepIndex ? ' active' : '') + (idx < lessonState.stepIndex ? ' done' : '');
+    pill.textContent = (idx + 1) + '. ' + step.label;
+    pill.setAttribute('role', 'listitem');
+    el.appendChild(pill);
+  });
+}
+
+function renderLesson() {
+  const lesson = getActiveLesson();
+  if (!lesson) return;
+  renderLessonSteps();
+  const body = $('lesson-body');
+  const back = $('btn-lesson-back');
+  const next = $('btn-lesson-next');
+  if (back) back.disabled = lessonState.stepIndex <= 0;
+  if (next) next.textContent = lessonState.stepIndex >= LESSON_STEPS.length - 1 ? '完成课卡' : '下一步';
+  const step = LESSON_STEPS[lessonState.stepIndex];
+  body.innerHTML = '';
+  if (!step) return;
+
+  if (step.id === 'goals') {
+    body.innerHTML = '<h3>Learning Goals</h3><p>这节课练完，你应能在会议里用上这些表达。</p>';
+    const ul = document.createElement('ul');
+    ul.className = 'lesson-goal-list';
+    (lesson.goals || []).forEach((g) => {
+      const li = document.createElement('li');
+      li.textContent = g;
+      ul.appendChild(li);
+    });
+    body.appendChild(ul);
+  } else if (step.id === 'warmup') {
+    body.innerHTML = '<h3>Warm-up · 语块</h3><p>先听例句，再跟说。点「练跟读」可整组练习。</p>';
+    const list = document.createElement('div');
+    list.className = 'lesson-chunk-list';
+    (lesson.chunks || []).forEach((c) => {
+      const card = document.createElement('div');
+      card.className = 'lesson-chunk';
+      card.innerHTML =
+        '<div class="when">' + escapeHtml(c.when || '') + '</div>' +
+        '<div class="en">' + escapeHtml(c.example || c.en || '') + '</div>' +
+        '<div class="zh">' + escapeHtml(c.zh || '') + (c.en ? ' · 模板：' + escapeHtml(c.en) : '') + '</div>';
+      const actions = document.createElement('div');
+      actions.className = 'lesson-inline-actions';
+      const hear = document.createElement('button');
+      hear.type = 'button';
+      hear.className = 'btn btn-ghost';
+      hear.textContent = '听例句';
+      hear.addEventListener('click', () => speak(c.example || c.en || ''));
+      actions.appendChild(hear);
+      card.appendChild(actions);
+      list.appendChild(card);
+    });
+    body.appendChild(list);
+    const actions = document.createElement('div');
+    actions.className = 'lesson-inline-actions';
+    const drill = document.createElement('button');
+    drill.type = 'button';
+    drill.className = 'btn btn-primary';
+    drill.textContent = '练跟读（本组语块）';
+    drill.addEventListener('click', () => startLessonPractice('shadow'));
+    actions.appendChild(drill);
+    body.appendChild(actions);
+  } else if (step.id === 'dialogue') {
+    body.innerHTML = '<h3>Model Dialogue</h3><p>先听整段示范，注意 You 的语块怎么接。</p>';
+    const list = document.createElement('div');
+    list.className = 'lesson-dialogue';
+    (lesson.dialogue || []).forEach((line) => {
+      const row = document.createElement('div');
+      row.className = 'lesson-line';
+      row.innerHTML = '<div class="role">' + escapeHtml(line.role || '') + '</div><div class="en">' + escapeHtml(line.en || '') + '</div>';
+      list.appendChild(row);
+    });
+    body.appendChild(list);
+    const actions = document.createElement('div');
+    actions.className = 'lesson-inline-actions';
+    const play = document.createElement('button');
+    play.type = 'button';
+    play.className = 'btn btn-primary';
+    play.textContent = '听整段对话';
+    play.addEventListener('click', playLessonDialogue);
+    const shadow = document.createElement('button');
+    shadow.type = 'button';
+    shadow.className = 'btn btn-ghost';
+    shadow.textContent = '跟读 You 的句子';
+    shadow.addEventListener('click', () => startLessonPractice('shadow-you'));
+    actions.appendChild(play);
+    actions.appendChild(shadow);
+    body.appendChild(actions);
+  } else if (step.id === 'practice') {
+    body.innerHTML = '<h3>Practice</h3><p>用跟读或 3 秒反射把语块调出来，再进角色扮演。</p>';
+    const actions = document.createElement('div');
+    actions.className = 'lesson-inline-actions';
+    const shadow = document.createElement('button');
+    shadow.type = 'button';
+    shadow.className = 'btn btn-primary';
+    shadow.textContent = '跟读练习';
+    shadow.addEventListener('click', () => startLessonPractice('shadow'));
+    const reflex = document.createElement('button');
+    reflex.type = 'button';
+    reflex.className = 'btn btn-ghost';
+    reflex.textContent = '语块反射';
+    reflex.addEventListener('click', () => startLessonPractice('reflex'));
+    actions.appendChild(shadow);
+    actions.appendChild(reflex);
+    body.appendChild(actions);
+  } else if (step.id === 'roleplay') {
+    body.innerHTML = '<h3>Roleplay</h3><p>用这节课的语块进入真实对练。练完点「下一环节」进入 Discussion。</p>';
+    const actions = document.createElement('div');
+    actions.className = 'lesson-inline-actions';
+    const go = document.createElement('button');
+    go.type = 'button';
+    go.className = 'btn btn-primary';
+    go.textContent = '开始角色扮演';
+    go.addEventListener('click', startLessonRoleplay);
+    actions.appendChild(go);
+    body.appendChild(actions);
+  } else if (step.id === 'discussion') {
+    body.innerHTML = '<h3>Discussion</h3><p>围绕本课内容讨论（Engoo 风格）。可先听题，再口头/打字回答。</p>';
+    renderQuestionList(body, lesson.discussion || [], 'discussion');
+  } else if (step.id === 'further') {
+    body.innerHTML = '<h3>Further Discussion</h3><p>迁移到你自己的真实工作场景。</p>';
+    renderQuestionList(body, lesson.further || [], 'further');
+  }
+}
+
+function renderQuestionList(body, questions, kind) {
+  const ol = document.createElement('ol');
+  ol.className = 'lesson-q-list';
+  (questions || []).forEach((q, idx) => {
+    const li = document.createElement('li');
+    li.textContent = q;
+    const actions = document.createElement('div');
+    actions.className = 'lesson-inline-actions';
+    const hear = document.createElement('button');
+    hear.type = 'button';
+    hear.className = 'btn btn-ghost';
+    hear.textContent = '听题';
+    hear.addEventListener('click', () => speak(q));
+    const ans = document.createElement('button');
+    ans.type = 'button';
+    ans.className = 'btn btn-primary';
+    ans.textContent = '开口答';
+    ans.addEventListener('click', () => {
+      speak(q).then(() => {
+        if (!isRecording) startMic('lesson-' + kind + '-' + idx);
+      });
+    });
+    actions.appendChild(hear);
+    actions.appendChild(ans);
+    li.appendChild(actions);
+    ol.appendChild(li);
+  });
+  body.appendChild(ol);
+}
+
+async function playLessonDialogue() {
+  const lesson = getActiveLesson();
+  if (!lesson) return;
+  for (const line of (lesson.dialogue || [])) {
+    if (!lessonState.active) return;
+    await speak((line.role ? line.role + '. ' : '') + (line.en || ''));
+  }
+}
+
+function startLessonPractice(kind) {
+  const lesson = getActiveLesson();
+  if (!lesson) return;
+  let lines = [];
+  if (kind === 'shadow-you') {
+    lines = (lesson.dialogue || [])
+      .filter((l) => /you/i.test(l.role || ''))
+      .map((l) => ({ en: l.en, zh: 'Model line · You' }));
+  } else if (kind === 'reflex') {
+    lines = (lesson.chunks || []).map((c) => ({
+      zh: (c.when ? '【' + c.when + '】' : '') + (c.zh || ''),
+      en: c.example || c.en,
+      stem: String(c.en || c.example || '').replace(/\.\.\./g, ' '),
+      variant: '',
+    }));
+  } else {
+    lines = (lesson.chunks || []).map((c) => ({
+      en: c.example || c.en,
+      zh: (c.when ? '【' + c.when + '】' : '') + (c.zh || ''),
+    }));
+  }
+  lines = lines.filter((l) => l.en);
+  if (!lines.length) return;
+  const panel = $('lesson-panel');
+  if (panel) panel.classList.add('hidden');
+  lessonState.returnAfterShadow = true;
+  showLessonRail(lesson.title + ' · Practice');
+  startShadowing(kind === 'reflex' ? 'reflex' : 'shadow');
+  shadowState.lines = lines;
+  shadowState.index = 0;
+  shadowState.hits = 0;
+  renderShadowLine();
+}
+
+function startLessonRoleplay() {
+  const lesson = getActiveLesson();
+  if (!lesson) return;
+  const hint = lesson.personaHint || 'dave';
+  const persona = PERSONAS.find((p) => p.id === hint) || currentPersona;
+  currentPersona = persona;
+  personaSelect.value = persona.id;
+  $('brand-avatar').textContent = persona.icon;
+  renderScenarioOptions();
+  const scenarioId = lesson.roleplayScenarioId || (persona.scenarios[0] && persona.scenarios[0].id);
+  const panel = $('lesson-panel');
+  if (panel) panel.classList.add('hidden');
+  if (chatEl) chatEl.classList.remove('hidden');
+  showLessonRail(lesson.title + ' · Roleplay');
+  startSession(scenarioId, { lessonId: lesson.id, lessonOpening: lesson.opening || '' });
+}
+
+function startWeakReflex() {
+  const open = getOpenWeakSpots(8);
+  if (!open.length) {
+    addMessage('system', '当前没有待练弱项。', null, null);
+    return;
+  }
+  startShadowing('reflex');
+  shadowState.lines = open.map((w) => ({
+    zh: (w.cue ? w.cue + ' · ' : '') + (w.zh || '调出这个自然表达'),
+    en: w.en,
+    stem: w.en,
+    variant: '',
+  }));
+  shadowState.index = 0;
+  shadowState.hits = 0;
+  renderShadowLine();
+}
+
+function lessonNext() {
+  if (!lessonState.active) return;
+  if (lessonState.stepIndex >= LESSON_STEPS.length - 1) {
+    bumpProgress('lesson');
+    addMessage('system', '✅ 会议课卡完成：' + ((getActiveLesson() || {}).title || '') + '。弱项已记入今日优先。', null, null);
+    exitLesson({ silent: true });
+    resetToWelcome();
+    return;
+  }
+  lessonState.stepIndex += 1;
+  // if advancing into roleplay from practice while chat hidden, just render
+  const panel = $('lesson-panel');
+  if (panel) panel.classList.remove('hidden');
+  if (chatEl) chatEl.classList.add('hidden');
+  const rail = $('lesson-rail');
+  if (rail) rail.classList.add('hidden');
+  renderLesson();
+}
+
+function lessonBack() {
+  if (!lessonState.active || lessonState.stepIndex <= 0) return;
+  lessonState.stepIndex -= 1;
+  const panel = $('lesson-panel');
+  if (panel) panel.classList.remove('hidden');
+  if (chatEl) chatEl.classList.add('hidden');
+  const rail = $('lesson-rail');
+  if (rail) rail.classList.add('hidden');
+  renderLesson();
+}
+
+function resumeLessonFromRail() {
+  if (!lessonState.active) return;
+  exitShadowing({ silent: true });
+  if (chatEl) chatEl.classList.add('hidden');
+  const panel = $('lesson-panel');
+  if (panel) panel.classList.remove('hidden');
+  const rail = $('lesson-rail');
+  if (rail) rail.classList.add('hidden');
+  renderLesson();
+}
+
 
 /* ---------------------------- 会话管理 ------------------------------ */
 function resetChatView(showWelcome) {
@@ -631,17 +1195,19 @@ function startSession(scenarioId, opts = {}) {
   clearChallenge();
   pauseHandsfree();
   const s = currentPersona.scenarios.find((x) => x.id === scenarioId) || currentPersona.scenarios[0];
+  const opening = opts.lessonOpening || s.opening;
   session = {
     id: Date.now(),
     persona: currentPersona.id,
     scenario: s.id,
     messages: [],
+    lessonId: opts.lessonId || (lessonState.active ? lessonState.lessonId : ''),
   };
   scenarioSelect.value = s.id;
   resetChatView(false);
-  addMessage('dave', s.opening, null, null);
-  if (opts.deferListen) speak(s.opening);
-  else speakThenMaybeListen(s.opening);
+  addMessage('dave', opening, null, null);
+  if (opts.deferListen) speak(opening);
+  else speakThenMaybeListen(opening);
   inputEl.focus();
 }
 
@@ -771,6 +1337,7 @@ function buildCorrectionCard(correction, focus, errors) {
 
   const better = extractBetter(correction);
   if (better) {
+    upsertWeakSpot(better, { source: '纠错', cue: focus || '' });
     const actions = document.createElement('div');
     actions.className = 'corr-actions';
     const hear = document.createElement('button');
@@ -2758,9 +3325,11 @@ function handleResayTranscript(spoken) {
   if (result.score >= 0.7) {
     addMessage('system', '✅ 重说过关（约 ' + pct + '% 词命中）。这个自然版可以收进语块库。', null, null);
     upsertPhrase(target, 'Recast', '', '', 'cued');
+    resolveWeakSpot(target);
   } else {
     const miss = result.missing.length ? '还缺：' + result.missing.join(', ') : '再靠近一点自然版';
     addMessage('system', '再试一次。命中约 ' + pct + '%。' + miss + '。目标：' + target, null, null);
+    upsertWeakSpot(target, { source: '重说失败' });
     resayTarget = target;
   }
 }
@@ -2888,14 +3457,29 @@ function isPause() {
 /* 语块反射的题目：用中文场景 cue 触发，对答案的「语块骨架」计分 */
 function buildReflexLines() {
   const templates = typeof MEETING_TEMPLATES !== 'undefined' ? MEETING_TEMPLATES : [];
-  return templates
+  const fromTemplates = templates
     .filter((t) => t.example)
     .map((t) => ({
-      zh: (t.label ? '【' + t.label + '】' : '') + (t.cue || t.zh || ''),
+      zh: (t.label ? '【' + t.label + '】' : '') + (t.cue || t.cue || t.zh || ''),
       en: t.example,
-      stem: t.en.replace(/\.\.\./g, ' '),
-      variant: t.variant || '',
+      stem: String(t.en || '').replace(/\.\.\./g, ' '),
+      variant: t.variant || t.variant || '',
     }));
+  const weak = getOpenWeakSpots(6).map((w) => ({
+    zh: (w.cue ? w.cue + ' · ' : '') + (w.zh || '调出这个自然表达'),
+    en: w.en,
+    stem: w.en,
+    variant: '',
+  }));
+  const seen = new Set();
+  const merged = [];
+  weak.concat(fromTemplates).forEach((line) => {
+    const key = String(line.en || '').toLowerCase();
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    merged.push(line);
+  });
+  return merged;
 }
 
 function stopReflexTimer() {
@@ -3040,6 +3624,20 @@ function exitShadowing(opts) {
   const panel = $('shadow-panel');
   if (panel) panel.classList.add('hidden');
   if (chatEl) chatEl.classList.remove('hidden');
+  if (wasActive && lessonState.active && lessonState.returnAfterShadow) {
+    lessonState.returnAfterShadow = false;
+    if (chatEl) chatEl.classList.add('hidden');
+    const lessonPanel = $('lesson-panel');
+    if (lessonPanel) lessonPanel.classList.remove('hidden');
+    const rail = $('lesson-rail');
+    if (rail) rail.classList.add('hidden');
+    // advance to next step after practice when user exits
+    if (LESSON_STEPS[lessonState.stepIndex] && LESSON_STEPS[lessonState.stepIndex].id === 'practice') {
+      // stay on practice so user can choose roleplay via next
+    }
+    renderLesson();
+    return;
+  }
   if (wasActive && !(opts && opts.silent)) {
     resetToWelcome();
   }
@@ -3095,10 +3693,12 @@ function handleShadowTranscript(spoken, err) {
       shadowState.answered = true;
       $('shadow-score-label').textContent = shadowState.hits + ' 命中';
       setShadowFeedback('补全成功（约 ' + pct + '%）。搭配开始进系统了 → 下一题', 'ok');
+      resolveWeakSpot(line.en);
     } else {
       shadowState.answered = true;
       const miss = result.missing.length ? '还缺：' + result.missing.join(', ') : '';
       setShadowFeedback('再猜/再说一遍。命中约 ' + pct + '%。' + miss + ' 完整句：' + line.en, 'bad');
+      upsertWeakSpot(line.en, { source: '半句暂停', cue: line.zh || '' });
     }
     inputEl.value = '';
     autoResize();
@@ -3118,16 +3718,20 @@ function handleShadowTranscript(spoken, err) {
         (line.variant ? ' 变形句：' + line.variant : '') + ' → 下一题',
         timedOut ? null : 'ok'
       );
+      resolveWeakSpot(line.en);
     } else {
       shadowState.answered = true;
       const miss = result.missing.length ? '缺：' + result.missing.join(', ') : '';
       setShadowFeedback('没调出这个语块。' + miss + ' 对照答案再说一遍，再点下一题。', 'bad');
+      upsertWeakSpot(line.en, { source: '语块反射', cue: line.zh || '' });
     }
   } else if (pass) {
     setShadowFeedback('跟上了（约 ' + pct + '% 词命中）。可以下一句。', 'ok');
+    resolveWeakSpot(line.en);
   } else {
     const miss = result.missing.length ? '漏了：' + result.missing.join(', ') : '节奏偏了';
     setShadowFeedback('再跟一遍。命中约 ' + pct + '%。' + miss, 'bad');
+    upsertWeakSpot(line.en, { source: '跟读', cue: line.zh || '' });
   }
   inputEl.value = '';
   autoResize();
@@ -3283,6 +3887,23 @@ function bindEvents() {
     if (!line) return;
     setShadowFeedback('开头提示：' + (line.head || '') + ' …', null);
     speak(line.head || '');
+  });
+
+  const lessonExit = $('btn-lesson-exit');
+  if (lessonExit) lessonExit.addEventListener('click', () => exitLesson());
+  const lessonBackBtn = $('btn-lesson-back');
+  if (lessonBackBtn) lessonBackBtn.addEventListener('click', lessonBack);
+  const lessonNextBtn = $('btn-lesson-next');
+  if (lessonNextBtn) lessonNextBtn.addEventListener('click', lessonNext);
+  const lessonResume = $('btn-lesson-resume');
+  if (lessonResume) lessonResume.addEventListener('click', resumeLessonFromRail);
+  const lessonAdvance = $('btn-lesson-advance');
+  if (lessonAdvance) lessonAdvance.addEventListener('click', () => {
+    // from roleplay rail → jump to discussion
+    if (!lessonState.active) return;
+    const idx = LESSON_STEPS.findIndex((s) => s.id === 'discussion');
+    if (idx >= 0) lessonState.stepIndex = idx;
+    resumeLessonFromRail();
   });
 }
 

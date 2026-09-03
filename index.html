@@ -38,6 +38,28 @@
           </div>
         </div>
 
+        <div id="lesson-panel" class="lesson-panel hidden" aria-live="polite">
+          <div class="shadow-head">
+            <div>
+              <h2 id="lesson-title">会议课</h2>
+              <p id="lesson-sub" class="shadow-sub">Goals → Warm-up → Dialogue → Practice → Roleplay → Discussion</p>
+            </div>
+            <button id="btn-lesson-exit" class="btn btn-ghost" type="button">退出</button>
+          </div>
+          <div class="lesson-steps" id="lesson-steps" role="list"></div>
+          <div id="lesson-body" class="lesson-body"></div>
+          <div class="lesson-controls">
+            <button id="btn-lesson-back" class="btn btn-ghost" type="button">上一步</button>
+            <button id="btn-lesson-next" class="btn btn-primary" type="button">下一步</button>
+          </div>
+        </div>
+
+        <div id="lesson-rail" class="lesson-rail hidden" aria-live="polite">
+          <span id="lesson-rail-label">会议课进行中</span>
+          <button id="btn-lesson-resume" class="btn btn-ghost" type="button">回到课卡</button>
+          <button id="btn-lesson-advance" class="btn btn-primary" type="button">下一环节</button>
+        </div>
+
         <div id="shadow-panel" class="shadow-panel hidden" aria-live="polite">
           <div class="shadow-head">
             <div>
