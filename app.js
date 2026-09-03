@@ -372,6 +372,13 @@ const DEFAULT_CONFIG = {
   asrContinuous: true,
   asrSilenceMs: 1400,
   asrInterim: true,
+  voiceEngine: 'browser',
+  voiceKey: '',
+  voiceAppId: '',
+  voiceCluster: 'volcano_tts',
+  ttsVoice: 'Cherry',
+  ttsModel: 'qwen3-tts-flash',
+  asrModel: 'fun-asr-flash',
 };
 
 const MAX_TOKENS = 800;
@@ -1325,6 +1332,64 @@ let ttsActive = false;
 let ttsBarrierTimer = null;
 let currentSpeakPromise = null;
 
+let cloudAudio = null;
+let cloudAsrRecorder = null;
+let cloudAsrChunks = [];
+let cloudAsrStream = null;
+let cloudAsrListening = false;
+let cloudAsrMime = 'audio/webm';
+
+function getCloudAudio() {
+  if (!cloudAudio) {
+    cloudAudio = new Audio();
+    cloudAudio.preload = 'auto';
+  }
+  return cloudAudio;
+}
+
+function voiceEngine() {
+  return (config.voiceEngine || 'browser').trim() || 'browser';
+}
+
+function usesCloudVoice() {
+  return typeof VoiceCloud !== 'undefined' && VoiceCloud.usesCloud(config);
+}
+
+function stopCloudAudio() {
+  if (!cloudAudio) return;
+  try {
+    cloudAudio.pause();
+    cloudAudio.removeAttribute('src');
+    cloudAudio.load();
+  } catch (e) { /* ignore */ }
+}
+
+async function stopCloudAsr(finalize) {
+  const rec = cloudAsrRecorder;
+  cloudAsrListening = false;
+  if (!rec) {
+    if (cloudAsrStream) {
+      cloudAsrStream.getTracks().forEach((t) => t.stop());
+      cloudAsrStream = null;
+    }
+    return null;
+  }
+  return new Promise((resolve) => {
+    const finish = () => {
+      try { if (cloudAsrStream) cloudAsrStream.getTracks().forEach((t) => t.stop()); } catch (e) { /* ignore */ }
+      cloudAsrStream = null;
+      cloudAsrRecorder = null;
+      const type = cloudAsrMime || 'audio/webm';
+      const blob = new Blob(cloudAsrChunks, { type });
+      cloudAsrChunks = [];
+      resolve(finalize ? blob : null);
+    };
+    rec.onstop = finish;
+    try { rec.stop(); } catch (e) { finish(); }
+  });
+}
+
+
 function clampRate(rate, fallback) {
   const n = Number(rate);
   if (!Number.isFinite(n) || n <= 0) return fallback;
@@ -1418,6 +1483,7 @@ function stopSpeakAll() {
   speakingAll = false;
   clearTtsBarrier();
   stopTtsWatchdog();
+  stopCloudAudio();
   try { if (window.speechSynthesis) speechSynthesis.cancel(); } catch (e) { /* ignore */ }
   updateSpeakAllBtn();
 }
@@ -1447,15 +1513,38 @@ function speakAllPhrases() {
     stopSpeakAll();
     return;
   }
-  if (!phrases.length || !window.speechSynthesis) return;
+  if (!phrases.length) return;
   speakListenId += 1;
   cancelHandsfreeListen();
+  speakingAll = true;
+  updateSpeakAllBtn();
+
+  if (usesCloudVoice()) {
+    const list = phrases.map((p) => p.en).filter(Boolean);
+    (async () => {
+      try {
+        for (const line of list) {
+          if (!speakingAll) break;
+          await speak(line, { rate: config.ttsRate });
+          await new Promise((r) => setTimeout(r, 280));
+        }
+      } finally {
+        speakingAll = false;
+        updateSpeakAllBtn();
+      }
+    })();
+    return;
+  }
+
+  if (!window.speechSynthesis) {
+    speakingAll = false;
+    updateSpeakAllBtn();
+    return;
+  }
   ttsGen += 1;
   ttsActive = false;
   const gen = ttsGen;
-  speakingAll = true;
   speakQueue = phrases.map((p) => p.en).filter(Boolean);
-  updateSpeakAllBtn();
   startTtsWatchdog();
   try { speechSynthesis.cancel(); } catch (e) { /* ignore */ }
   setTimeout(() => drainSpeakQueue(gen, { rate: config.ttsRate }), 80);
@@ -1469,11 +1558,15 @@ function stopTTS() {
   clearTtsBarrier();
   stopTtsWatchdog();
   updateSpeakAllBtn();
+  stopCloudAudio();
   try { if (window.speechSynthesis) speechSynthesis.cancel(); } catch (e) { /* ignore */ }
 }
 
 function isTtsPlaying() {
   if (ttsActive) return true;
+  try {
+    if (cloudAudio && !cloudAudio.paused && !cloudAudio.ended) return true;
+  } catch (e) { /* ignore */ }
   try {
     return !!(window.speechSynthesis && (speechSynthesis.speaking || speechSynthesis.pending));
   } catch (e) {
@@ -1481,7 +1574,7 @@ function isTtsPlaying() {
   }
 }
 
-function speak(text, opts) {
+function speakBrowser(text, opts) {
   const p = new Promise((resolve) => {
     let settled = false;
     let safety = null;
@@ -1556,6 +1649,72 @@ function speak(text, opts) {
   currentSpeakPromise = p;
   return p;
 }
+
+function speak(text, opts) {
+  if (!text) return Promise.resolve();
+  if (!usesCloudVoice()) return speakBrowser(text, opts);
+
+  const p = new Promise(async (resolve) => {
+    let settled = false;
+    let gen = ttsGen;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTtsBarrier();
+      if (gen === ttsGen) ttsActive = false;
+      resolve();
+    };
+    ttsGen += 1;
+    gen = ttsGen;
+    ttsActive = true;
+    speakingAll = false;
+    clearTtsBarrier();
+    stopTtsWatchdog();
+    updateSpeakAllBtn();
+    stopCloudAudio();
+    try { if (window.speechSynthesis) speechSynthesis.cancel(); } catch (e) { /* ignore */ }
+
+    const chunks = splitForTts(text);
+    const audio = getCloudAudio();
+    const rate = clampRate((opts && opts.rate != null) ? opts.rate : config.ttsRate, 0.95);
+    // Map UI rate (0.7–1.3) onto provider speed when supported.
+    const cfg = { ...config, ttsRate: rate };
+
+    try {
+      for (const chunk of chunks) {
+        if (gen !== ttsGen) break;
+        await VoiceCloud.synthesize(chunk, cfg, audio);
+        if (gen !== ttsGen) break;
+        if (chunks.indexOf(chunk) < chunks.length - 1) {
+          await new Promise((r) => setTimeout(r, 160));
+        }
+      }
+      if (gen === ttsGen) {
+        const barrier = config.speakThenListen === false ? 90 : 240;
+        clearTtsBarrier();
+        ttsBarrierTimer = setTimeout(() => {
+          ttsBarrierTimer = null;
+          finish();
+        }, barrier);
+        return;
+      }
+      finish();
+    } catch (err) {
+      console.warn('cloud TTS failed, fallback browser', err);
+      if (gen === ttsGen) {
+        ttsActive = false;
+        addMessage('system', '云端 TTS 失败，已回退浏览器朗读：' + (err && err.message ? err.message : err), null, null);
+        speakBrowser(text, opts).then(finish);
+        return;
+      }
+      finish();
+    }
+  });
+  currentSpeakPromise = p;
+  return p;
+}
+
+
 
 function waitForTtsThenListen() {
   const snapshot = ttsGen;
@@ -1700,15 +1859,23 @@ function startChallengeCountdown() {
   challengeRaf = requestAnimationFrame(tick);
 }
 
-function updateMicStatus() {
+function updateMicStatus(extra) {
   const el = $('mic-status');
   const btn = $('btn-mic');
   if (btn) btn.classList.toggle('handsfree-on', !!config.handsfree);
   if (!el) return;
+  const engine = voiceEngine();
+  const tag = engine === 'aliyun' ? '阿里云' : (engine === 'volc' ? '火山' : '浏览器');
+  if (extra) {
+    el.textContent = '[' + tag + '] ' + extra;
+    return;
+  }
   if (config.handsfree) {
-    el.textContent = isRecording ? '免提中 · 正在听你说…' : '免提模式已开 · 对方说完会自动听你说';
+    el.textContent = (isRecording || cloudAsrListening)
+      ? '[' + tag + '] 免提中 · 正在听你说…'
+      : '[' + tag + '] 免提已开 · 对方说完会自动听你说';
   } else {
-    el.textContent = '点击 🎤 开始说话（需要 localhost 或 HTTPS）';
+    el.textContent = '[' + tag + '] 点击 🎤 开始说话（需要 localhost 或 HTTPS）';
   }
 }
 
@@ -1928,10 +2095,6 @@ function startMic(source) {
     }
     return;
   }
-  if (!('SpeechRecognition' in window) && !('webkitSpeechRecognition' in window)) {
-    addMessage('system', '当前浏览器不支持语音识别（Web Speech API），请用 Chrome / Edge，并走 localhost 或 HTTPS。', null, null);
-    return;
-  }
   if (source !== 'shadow') markChallengeOpened();
   speakListenId += 1;
   cancelHandsfreeListen();
@@ -1942,6 +2105,16 @@ function startMic(source) {
     return;
   }
   stopTTS();
+
+  if (usesCloudVoice()) {
+    startCloudMic(source || 'manual');
+    return;
+  }
+
+  if (!('SpeechRecognition' in window) && !('webkitSpeechRecognition' in window)) {
+    addMessage('system', '当前浏览器不支持语音识别（Web Speech API），请用 Chrome / Edge，并走 localhost 或 HTTPS。', null, null);
+    return;
+  }
   if (!recognition) recognition = setupRecognition();
   if (isRecording) return;
   micSource = source || 'manual';
@@ -1953,7 +2126,6 @@ function startMic(source) {
   try {
     recognition.start();
   } catch (e) {
-    // Restart once if previous instance was mid-cycle.
     try {
       recognition = setupRecognition();
       recognition.start();
@@ -1965,11 +2137,86 @@ function startMic(source) {
   }
 }
 
+async function startCloudMic(source) {
+  if (isRecording || cloudAsrListening) return;
+  micSource = source || 'manual';
+  asrSessionId += 1;
+  resetAsrBuffer();
+  cloudAsrChunks = [];
+  try {
+    cloudAsrStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true },
+    });
+  } catch (e) {
+    addMessage('system', '无法打开麦克风：' + (e && e.message ? e.message : e), null, null);
+    return;
+  }
+  const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+    ? 'audio/webm;codecs=opus'
+    : (MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : '');
+  cloudAsrMime = mime || 'audio/webm';
+  try {
+    cloudAsrRecorder = mime ? new MediaRecorder(cloudAsrStream, { mimeType: mime }) : new MediaRecorder(cloudAsrStream);
+  } catch (e) {
+    cloudAsrStream.getTracks().forEach((t) => t.stop());
+    cloudAsrStream = null;
+    addMessage('system', '当前浏览器无法录音（MediaRecorder）：' + (e && e.message ? e.message : e), null, null);
+    return;
+  }
+  cloudAsrRecorder.ondataavailable = (ev) => {
+    if (ev.data && ev.data.size) cloudAsrChunks.push(ev.data);
+  };
+  cloudAsrListening = true;
+  isRecording = true;
+  $('btn-mic').classList.add('recording');
+  updateMicStatus();
+  cloudAsrRecorder.start(250);
+  // Auto-stop after silence window + hard cap so handsfree can finish a turn.
+  const session = asrSessionId;
+  const maxMs = Math.max(8000, asrSilenceMs() * 6);
+  setTimeout(() => {
+    if (session === asrSessionId && cloudAsrListening) stopCloudMicAndTranscribe();
+  }, maxMs);
+}
+
+async function stopCloudMicAndTranscribe() {
+  if (!cloudAsrListening && !cloudAsrRecorder) return;
+  const session = asrSessionId;
+  const blob = await stopCloudAsr(true);
+  isRecording = false;
+  $('btn-mic').classList.remove('recording');
+  updateMicStatus();
+  if (session !== asrSessionId) return;
+  if (!blob || blob.size < 800) {
+    finishAsrTurn('', 'no-speech');
+    return;
+  }
+  try {
+    updateMicStatus('识别中…');
+    const text = await VoiceCloud.transcribe(blob, config);
+    if (session !== asrSessionId) return;
+    if (inputEl && text) {
+      inputEl.value = text;
+      if (typeof autoResize === 'function') autoResize();
+    }
+    finishAsrTurn(text || '', '');
+  } catch (err) {
+    console.warn('cloud ASR failed', err);
+    addMessage('system', '云端 ASR 失败：' + (err && err.message ? err.message : err) + '。可改回「浏览器」引擎，或检查 Key / CORS。', null, null);
+    finishAsrTurn('', 'network');
+  }
+}
+
+
 function toggleMic() {
-  if (isRecording) {
+  if (isRecording || cloudAsrListening) {
     speakListenId += 1;
     cancelHandsfreeListen();
     clearAsrSilence();
+    if (usesCloudVoice() && (cloudAsrListening || cloudAsrRecorder)) {
+      stopCloudMicAndTranscribe();
+      return;
+    }
     recognition && recognition.stop();
     return;
   }
@@ -2180,6 +2427,20 @@ function fillIndustryOptions() {
   });
 }
 
+
+function syncVoiceCloudFields() {
+  const engineEl = $('cfg-voice-engine');
+  const engine = engineEl ? engineEl.value : (config.voiceEngine || 'browser');
+  const box = $('voice-cloud-fields');
+  if (box) box.classList.toggle('hidden', engine === 'browser');
+  const appWrap = $('voice-appid-wrap');
+  if (appWrap) appWrap.classList.toggle('hidden', engine !== 'volc');
+  const voiceInput = $('cfg-tts-voice');
+  if (voiceInput && !voiceInput.value.trim()) {
+    voiceInput.placeholder = engine === 'volc' ? 'en_female_sarah_mars_bigtts' : 'Cherry';
+  }
+}
+
 function openSettings() {
   fillIndustryOptions();
   $('cfg-base').value = config.base;
@@ -2198,6 +2459,11 @@ function openSettings() {
   if ($('cfg-asr-continuous')) $('cfg-asr-continuous').checked = config.asrContinuous !== false;
   if ($('cfg-asr-silence')) $('cfg-asr-silence').value = asrSilenceMs();
   if ($('cfg-asr-interim')) $('cfg-asr-interim').checked = config.asrInterim !== false;
+  if ($('cfg-voice-engine')) $('cfg-voice-engine').value = config.voiceEngine || 'browser';
+  if ($('cfg-voice-key')) $('cfg-voice-key').value = config.voiceKey || '';
+  if ($('cfg-voice-appid')) $('cfg-voice-appid').value = config.voiceAppId || '';
+  if ($('cfg-tts-voice')) $('cfg-tts-voice').value = config.ttsVoice || '';
+  syncVoiceCloudFields();
   $('settings-overlay').classList.remove('hidden');
 }
 function closeSettings() { $('settings-overlay').classList.add('hidden'); }
@@ -2225,6 +2491,14 @@ function saveSettings() {
   config.asrContinuous = $('cfg-asr-continuous') ? $('cfg-asr-continuous').checked : true;
   config.asrSilenceMs = $('cfg-asr-silence') ? Number($('cfg-asr-silence').value) : 1400;
   config.asrInterim = $('cfg-asr-interim') ? $('cfg-asr-interim').checked : true;
+  config.voiceEngine = $('cfg-voice-engine') ? ($('cfg-voice-engine').value || 'browser') : (config.voiceEngine || 'browser');
+  config.voiceKey = $('cfg-voice-key') ? $('cfg-voice-key').value.trim() : (config.voiceKey || '');
+  config.voiceAppId = $('cfg-voice-appid') ? $('cfg-voice-appid').value.trim() : (config.voiceAppId || '');
+  config.ttsVoice = $('cfg-tts-voice') ? $('cfg-tts-voice').value.trim() : (config.ttsVoice || '');
+  if (config.voiceEngine === 'aliyun' && !config.ttsVoice) config.ttsVoice = 'Cherry';
+  if (config.voiceEngine === 'volc' && !config.ttsVoice) config.ttsVoice = 'en_female_sarah_mars_bigtts';
+  // Reuse chat key for Aliyun when voice key left blank.
+  if (config.voiceEngine === 'aliyun' && !config.voiceKey && config.key) config.voiceKey = config.key;
   persistOrWarn('dave_config', config);
   closeSettings();
   const asrChanged =
@@ -2234,7 +2508,7 @@ function saveSettings() {
   if (asrChanged) invalidateRecognition();
   updateMicStatus();
   renderTemplates();
-  addMessage('system', '✅ 设置已保存（Key 仅存本机浏览器）。', null, null);
+  addMessage('system', '✅ 设置已保存（Key 仅存本机浏览器）。语音引擎：' + (config.voiceEngine || 'browser'), null, null);
   if (!config.threeSecond) clearChallenge();
   if (!config.handsfree) {
     pauseHandsfree();
@@ -2262,6 +2536,10 @@ function readSettingsForm() {
     asrContinuous: $('cfg-asr-continuous') ? $('cfg-asr-continuous').checked : config.asrContinuous !== false,
     asrSilenceMs: $('cfg-asr-silence') ? Number($('cfg-asr-silence').value) : config.asrSilenceMs,
     asrInterim: $('cfg-asr-interim') ? $('cfg-asr-interim').checked : config.asrInterim !== false,
+    voiceEngine: $('cfg-voice-engine') ? ($('cfg-voice-engine').value || 'browser') : (config.voiceEngine || 'browser'),
+    voiceKey: $('cfg-voice-key') ? $('cfg-voice-key').value.trim() : (config.voiceKey || ''),
+    voiceAppId: $('cfg-voice-appid') ? $('cfg-voice-appid').value.trim() : (config.voiceAppId || ''),
+    ttsVoice: $('cfg-tts-voice') ? $('cfg-tts-voice').value.trim() : (config.ttsVoice || ''),
   };
 }
 
@@ -2947,6 +3225,7 @@ function bindEvents() {
   $('btn-settings').addEventListener('click', openSettings);
   $('btn-close-settings').addEventListener('click', closeSettings);
   $('btn-save').addEventListener('click', saveSettings);
+  if ($('cfg-voice-engine')) $('cfg-voice-engine').addEventListener('change', syncVoiceCloudFields);
   $('btn-test').addEventListener('click', testConnection);
 
   $('settings-overlay').addEventListener('click', (e) => {

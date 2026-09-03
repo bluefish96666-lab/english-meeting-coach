@@ -623,6 +623,16 @@ html, body {
   color: var(--muted);
   text-transform: none;
 }
+.voice-cloud-fields {
+  display: grid;
+  gap: 10px;
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-2);
+}
+.voice-cloud-fields.hidden { display: none; }
 .modal-foot { display: flex; justify-content: flex-end; gap: 8px; }
 
 /* 滚动条 */
